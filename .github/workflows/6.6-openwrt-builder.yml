@@ -1,0 +1,150 @@
+# ============================================================
+# 1. 触发条件 (Triggers)
+# ============================================================
+name: Build OpenWrt Firmware
+
+on:
+  workflow_dispatch:  # 允许在网页端手动点击按钮触发
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+  #schedule:
+  #  - cron: 0 16 * * 5  # 定时触发：每周五 UTC 16:00 (北京时间周六 0:00)
+  # push:
+  #   branches: [ main ] # 取消注释则会在 push 代码到 main 分支时触发
+
+# ============================================================
+# 2. 全局环境变量 (Environment Variables)
+# ============================================================
+env:
+  REPO_URL: https://github.com/fat4-alt/immortalwrt-mt798x-5.4
+  REPO_BRANCH: openwrt-24.10-6.6
+  CONFIG_FILE: .config
+  DIY_SH: diy.sh
+  FREE_SPACE: true
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+# ============================================================
+# 3. 任务定义 (Jobs)
+# ============================================================
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    # --------------------------------------------------------
+    # 步骤 1：检出当前仓库代码
+    # --------------------------------------------------------
+    - name: Checkout
+      uses: actions/checkout@main
+
+    # --------------------------------------------------------
+    # 步骤 2：清理磁盘空间 (OpenWrt 编译必备)
+    # --------------------------------------------------------
+    - name: Free Disk Space
+      if: env.FREE_SPACE == 'true'
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        swap-storage: true
+
+    # --------------------------------------------------------
+    # 步骤 3：初始化编译环境 (安装依赖)
+    # --------------------------------------------------------
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo apt-get update -y && sudo apt-get full-upgrade -y
+        sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+        
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    # --------------------------------------------------------
+    # 步骤 4：克隆 OpenWrt 源码
+    # --------------------------------------------------------
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    # --------------------------------------------------------
+    # 步骤 5：加载自定义脚本 (DIY) 和更新 Feeds
+    # --------------------------------------------------------
+    - name: Load custom feeds & Update feeds
+      run: |
+        cd openwrt
+        [ -e $GITHUB_WORKSPACE/$DIY_SH ] && mv $GITHUB_WORKSPACE/$DIY_SH ./diy.sh
+        chmod +x ./diy.sh
+        ./diy.sh
+        echo 'src-git qmodem https://github.com/FUjr/QModem.git;main' >> feeds.conf.default
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        ./scripts/feeds update qmodem
+        ./scripts/feeds install -a -p qmodem
+        ./scripts/feeds install -a -f -p qmodem
+        
+
+    # --------------------------------------------------------
+    # 步骤 6：生成配置文件 (.config)
+    # --------------------------------------------------------
+    - name: Generate configuration file
+      run: |
+        cd openwrt
+        [ -e $GITHUB_WORKSPACE/$CONFIG_FILE ] && mv $GITHUB_WORKSPACE/$CONFIG_FILE .config
+        make defconfig
+
+    # --------------------------------------------------------
+    # 步骤 7：下载依赖包
+    # --------------------------------------------------------
+    - name: Download packages
+      run: |
+        cd openwrt
+        make download -j16
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    # --------------------------------------------------------
+    # 步骤 8：编译固件
+    # --------------------------------------------------------
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    # --------------------------------------------------------
+    # 步骤 9：整理并上传固件 (Artifacts)
+    # --------------------------------------------------------
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && steps.compile.outputs.status == 'success'
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success'
+      with:
+        name: ImmortalWrt-6.6_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
