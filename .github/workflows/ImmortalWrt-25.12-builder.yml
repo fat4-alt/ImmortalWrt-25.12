@@ -16,7 +16,7 @@ on:
 # ============================================================
 env:
   REPO_URL: https://github.com/fat4-alt/immortalwrt
-  REPO_BRANCH: master
+  REPO_BRANCH: openwrt-25.12
   CONFIG_FILE: .config
   DIY_SH: diy.sh
   FREE_SPACE: true
