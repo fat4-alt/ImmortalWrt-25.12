@@ -24,21 +24,30 @@
 	status = "okay";
 
 	/* ------------------------------------------------------------------
-	 * 【必须替换】<WAN_DEV> = 5G 模块 / 拨号后真正承载默认路由的 netdev 名
+	 * ★★ 重要修正（第二轮实测后）：mtketh-wan 绝不能填 wwan0 ★★
 	 *
-	 * 取值方法（刷任意一版能上网的固件后执行）：
-	 *   uci get network.wan.device
-	 *   ifstatus wan | jsonfilter -e '@["device"]'
-	 *   ip -br link
-	 *   ip route get 1.1.1.1
-	 * 常见：wwan0 / usb0 / mhi_hwip0 / rmnet_mhi0.1 / eth1(USB 网卡) / wan
+	 * hnat.h:1368  IS_WAN(dev) = 前缀匹配 hnat_priv->wan
+	 * hnat_nf_hook.c:2878 出接口分支顺序是：
+	 *     if (IS_LAN_GRP(dev) || IS_WAN(dev))  → "Forward to GMAC Ports"
+	 *     else if (IS_EXT(dev) && ...)         → gmac = NR_PDMA_PORT（外部设备路径）
 	 *
-	 * 规则不同，别混：
-	 *   mtketh-wan  -> IS_WAN() 前缀匹配 + dev_get_by_name()，名字要真实存在
-	 *   ext-devices -> strcmp 精确匹配（hnat_nf_hook.c:173），含 ".1" 也要写全
-	 * 有多个接口就全列：ext-devices = "wwan0", "wwan0_1", "usb0";
+	 * 若 mtketh-wan = "wwan0"，wwan0 同时命中 IS_WAN 和 IS_EXT，
+	 * IS_WAN 在第一个分支抢先，驱动对 wwan0 这个纯软件 netdev 调
+	 * netdev_priv()/HNAT_GMAC_FP() 取 GMAC id —— 读到的是无效值，
+	 * FOE 表项出接口全错：有线 LAN 和 WiFi（FROM_WED 也在 ext 分支条件里）
+	 * 的流量一起被丢，表现为「开硬件加速全网断，关掉就正常」。
+	 *
+	 * 正确做法：wan 保持「不存在的 GMAC 名」，让 IS_WAN 不命中任何真实
+	 * 接口；wwan0 只通过 ext-devices 注册为 IS_EXT，走 NR_PDMA_PORT 分支。
+	 * 这正是原版 hnat-detect 在解析不出 5G WAN 时 "do NOT touch WAN"、
+	 * 保留驱动默认 eth1 的原因（hnat.c:1798）。本机没有 eth1，天然不命中。
+	 *
+	 * <WAN_DEV> 只填到 ext-devices（strcmp 精确匹配，hnat_nf_hook.c:173）。
+	 * 取值：ip route get 1.1.1.1 的 dev，不是 uci get network.wan.device。
+	 * 常见：wwan0 / usb0 / mhi_hwip0 / rmnet_mhi0.1（含 .1 要写全）。
+	 * 多个接口全列：ext-devices = "wwan0", "wwan0_1", "usb0";
 	 * ------------------------------------------------------------------ */
-	mtketh-wan = "<WAN_DEV>";
+	mtketh-wan = "eth1";		/* 故意填本机不存在的 GMAC，勿改成 <WAN_DEV> */
 	ext-devices = "<WAN_DEV>";
 
 	/* LAN 侧：DSA user port 名 "lan"。IS_LAN() 是前缀匹配，填 "lan" 即可 */
@@ -58,12 +67,14 @@
 	 *   WAN 不是 MT7531 的 DSA 口，写了会让 hnat_dsa_is_enable() 为真，
 	 *   PPE 给包打 DSA tag 发往交换机，反而更错。
 	 *
-	 * 【情形 B：WAN 实际是网线口 port@3，5G 模块另有用途】
-	 *   把上面两行改成：
+	 * 【情形 B：WAN 实际是网线口 port@3（真 GMAC/DSA 口）】
+	 *   只有这种情况才把 mtketh-wan 改成真实口名：
 	 *       mtketh-wan = "wan";
 	 *       ext-devices = "<5G 模块真实接口名>";   // 若它不做 WAN 可整行删除
 	 *   并在此处加：
 	 *       mtkdsa-wan-port = <3>;
+	 *   判据：WAN 必须是能跑 netdev_priv() 取 GMAC id 的以太网口。
+	 *   wwan0/mhi/rmnet 这类软件 netdev 永远走情形 A。
 	 * ------------------------------------------------------------------ */
 };
 
