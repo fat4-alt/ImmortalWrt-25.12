@@ -67,22 +67,20 @@ start() {
 		ip link set rxppd master "$BR" 2>/dev/null
 	fi
 
-	# ---- 2. 写静态映射，覆盖驱动默认值 ----
+	# ---- 2. 写静态映射（只写 lan/lan2/ppd，绝不写 hnat_wan_if）----
 	# hnat.c 默认：wan=eth1 / lan=eth0 / lan2=eth2 / ppd=eth0
-	# 本机单 gmac0，eth1/eth2 都不存在，必须覆盖。
+	# lan/lan2/ppd 必须覆盖；wan 必须【保持 eth1 不变】。
+	#
+	# ★ 第二轮实测修正：绝不能 echo "$WAN_DEV" > hnat_wan_if。
+	#   一旦把 hnat_priv->wan 写成 wwan0，出接口侧 IS_WAN(wwan0) 会在
+	#   hnat_nf_hook.c:2878 抢在 IS_EXT 分支(2894) 之前，把纯软件 netdev
+	#   当 GMAC 口处理 → 有线 + WiFi 全部断网。
+	#   wwan0 只由 DTS 的 ext-devices 注册，走 2894 的 NR_PDMA_PORT 分支。
+	#   原版 hnat-detect 解析不出 5G WAN 时也是 "do NOT touch WAN"。
+	#
 	# echo 0 会走 hnat_disable_hook()：注销 nf hook + 清掉全部 BIND FOE 表项，
 	# 开机清一次是好事；写回 1 重新注册。
 	echo 0 > "$P/hook_toggle"
-
-	# hnat_wan_if_write 会 dev_get_by_name()，设备不存在会 -ENODEV。
-	# 5G 模块可能比本脚本晚就绪，所以只在设备已出现时才写；
-	# 名字本身已由 DTS 静态写入 hnat_priv->wan，g_wandev 是懒加载，
-	# 设备晚出现不影响最终生效。
-	if [ -e "/sys/class/net/$WAN_DEV" ]; then
-		echo "$WAN_DEV" > "$P/hnat_wan_if"
-	else
-		logger -t fzs-hnat "wan dev $WAN_DEV not up yet, keep DTS value"
-	fi
 
 	echo "$LAN_DEV"  > "$P/hnat_lan_if"
 	echo "$LAN2_DEV" > "$P/hnat_lan2_if"
@@ -90,7 +88,7 @@ start() {
 
 	echo 1 > "$P/hook_toggle"
 
-	logger -t fzs-hnat "static: wan=$WAN_DEV lan=$LAN_DEV lan2=$LAN2_DEV ppd=$PPD_DEV rxppd=$BR"
+	logger -t fzs-hnat "static: ext=$WAN_DEV wan=eth1(unused) lan=$LAN_DEV lan2=$LAN2_DEV ppd=$PPD_DEV rxppd=$BR"
 }
 
 stop() {
