@@ -117,6 +117,11 @@ grep -q '^# CONFIG_PACKAGE_hnat-detect is not set$' .config || \
 grep -q '^CONFIG_PACKAGE_kmod-dummy=y$' .config || echo 'CONFIG_PACKAGE_kmod-dummy=y' >> .config
 grep -q '^CONFIG_PACKAGE_kmod-mediatek_hnat=y$' .config || echo 'CONFIG_PACKAGE_kmod-mediatek_hnat=y' >> .config
 grep -q '^CONFIG_PACKAGE_luci-app-turboacc-mtk=y$' .config || echo 'CONFIG_PACKAGE_luci-app-turboacc-mtk=y' >> .config
+# hnat-detect 原本依赖 +ip(+ip-tiny) +ip-bridge；删掉它后这两个包可能
+# 不再被自动拉入，/sbin/ip 会回退成 BusyBox applet（不支持 link add/-br）。
+# 显式兜底，配合 06 脚本里的 dummy0 回退双保险。
+grep -q '^CONFIG_PACKAGE_ip-tiny=y$' .config || echo 'CONFIG_PACKAGE_ip-tiny=y' >> .config
+grep -q '^CONFIG_PACKAGE_ip-bridge=y$' .config || echo 'CONFIG_PACKAGE_ip-bridge=y' >> .config
 grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_fzs_5gcpe-p5=y$' .config || {
     echo "ERROR: .config 里没有选中 fzs_5gcpe-p5 设备"; exit 1; }
 echo "[B3] .config OK: 设备=$(grep -c '^CONFIG_TARGET_mediatek_filogic_DEVICE_fzs_5gcpe-p5=y' .config), 探测包已禁用"
