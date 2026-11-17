@@ -1,1 +1,83 @@
+#!/bin/sh /etc/rc.common
+# =============================================================
+# 放置路径：files/etc/init.d/fzs-hnat
+# 权限    ：755
+# 由 05_uci-defaults_zz-fzs-hnat-static 执行 enable，生成 S95 链接
+#
+# 为什么需要"每次开机"的脚本：
+#   rxppd 是 `ip link add ... type dummy` 造出来的纯运行时设备，
+#   断电即消失；而 uci-defaults 只在首次开机跑一次。
+#   DTS 的 &hnat 负责 probe 期静态值，本脚本负责运行时设备与兜底。
+#
+# START=95：排在 turboacc(90) 之后，保证 hook_toggle 最终为 1。
+# =============================================================
+
+START=95
+STOP=10
+
+# ---------- 【必须替换】与 03_dts_hnat_append.dts 保持完全一致 ----------
+WAN_DEV="wwan0"          # TODO: 改成 ip -br link / uci get network.wan.device 的真实值
+LAN_DEV="lan"
+LAN2_DEV="/"
+PPD_DEV="eth0"
+# ---------------------------------------------------------------------------
+
+P=/sys/kernel/debug/hnat
+BR="br-lan"
+
+start() {
+	[ -d "$P" ] || {
+		logger -t fzs-hnat "skip: $P missing (CONFIG_NET_MEDIATEK_HNAT 未打开?)"
+		return 0
+	}
+
+	# ---- 1. 重建 rxppd ----
+	# 02_network 已把 rxppd 登记进 br-lan.ports，netifd 会在设备出现时
+	# 自动挂桥；这里只负责创建并 up，master 交给 netifd。
+	if ! ip link show rxppd >/dev/null 2>&1; then
+		modprobe dummy 2>/dev/null
+		ip link add rxppd type dummy || {
+			logger -t fzs-hnat "ERROR: cannot create rxppd"
+			return 1
+		}
+	fi
+	ip link set rxppd up
+
+	# 兜底：若 netifd 尚未把 rxppd 挂进桥（例如 network reload 时序），
+	# 手工挂一次；netifd 重建桥时会重新接管。
+	if ! bridge link show dev rxppd 2>/dev/null | grep -q "master $BR"; then
+		ip link set rxppd master "$BR" 2>/dev/null
+	fi
+
+	# ---- 2. 写静态映射，覆盖驱动默认值 ----
+	# hnat.c 默认：wan=eth1 / lan=eth0 / lan2=eth2 / ppd=eth0
+	# 本机单 gmac0，eth1/eth2 都不存在，必须覆盖。
+	# echo 0 会走 hnat_disable_hook()：注销 nf hook + 清掉全部 BIND FOE 表项，
+	# 开机清一次是好事；写回 1 重新注册。
+	echo 0 > "$P/hook_toggle"
+
+	# hnat_wan_if_write 会 dev_get_by_name()，设备不存在会 -ENODEV。
+	# 5G 模块可能比本脚本晚就绪，所以只在设备已出现时才写；
+	# 名字本身已由 DTS 静态写入 hnat_priv->wan，g_wandev 是懒加载，
+	# 设备晚出现不影响最终生效。
+	if [ -e "/sys/class/net/$WAN_DEV" ]; then
+		echo "$WAN_DEV" > "$P/hnat_wan_if"
+	else
+		logger -t fzs-hnat "wan dev $WAN_DEV not up yet, keep DTS value"
+	fi
+
+	echo "$LAN_DEV"  > "$P/hnat_lan_if"
+	echo "$LAN2_DEV" > "$P/hnat_lan2_if"
+	echo "$PPD_DEV"  > "$P/hnat_ppd_if"
+
+	echo 1 > "$P/hook_toggle"
+
+	logger -t fzs-hnat "static: wan=$WAN_DEV lan=$LAN_DEV lan2=$LAN2_DEV ppd=$PPD_DEV rxppd=$BR"
+}
+
+stop() {
+	# 不主动改 hook_toggle / 不删 rxppd：
+	# 交给 turboacc 和 netifd 管理，避免 service 重启时把流表反复清空。
+	return 0
+}
 
