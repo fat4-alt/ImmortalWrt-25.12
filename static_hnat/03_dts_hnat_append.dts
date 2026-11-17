@@ -1,0 +1,80 @@
+/* =========================================================================
+ * 追加到 0.txt（mt7981b-fzs-5gcpe-p5.dts）文件【末尾】
+ * 即 &wifi { ... }; 之后，不要插在 / { ... }; 内部
+ *
+ * FZS 5GCPE P5 / ImmortalWrt 25.12 / Linux 6.12 / 方案 1 静态 HNAT
+ *
+ * 本机拓扑（来自 0.txt）：
+ *   gmac0 (eth0) --2500base-x--> MT7531 port@6 (CPU)
+ *   MT7531 port@2 = lan      MT7531 port@3 = wan
+ *   仅一个 GMAC，无 eth1/eth2
+ *
+ * 驱动源码依据：
+ *   hnat.c:1796-1822  mtketh-wan/lan/lan2/ppd 的 probe 默认值
+ *   hnat.c:1825-1830  mtketh-max-gmac 缺失 -> -EINVAL，probe 直接失败
+ *   hnat.c:1836-1843  mtkdsa-wan-port 缺失 -> NONE_DSA_PORT
+ *   hnat.c:1845-1850  mtketh-ppe-num 缺省 1
+ *   hnat.c:1899-1909  ext-devices 只在 probe 时读一次
+ *   hnat.h:1364-1382  IS_WAN/IS_LAN 前缀匹配；IS_PPD/ext_if 精确匹配
+ *   hnat_nf_hook.c:166-176,416-423  ext 设备 NETDEV_UP 时按名字精确绑定
+ *   hnat_nf_hook.c:959-962         IS_EXT 判定优先于 IS_WAN
+ * ========================================================================= */
+
+&hnat {
+	status = "okay";
+
+	/* ------------------------------------------------------------------
+	 * 【必须替换】<WAN_DEV> = 5G 模块 / 拨号后真正承载默认路由的 netdev 名
+	 *
+	 * 取值方法（刷任意一版能上网的固件后执行）：
+	 *   uci get network.wan.device
+	 *   ifstatus wan | jsonfilter -e '@["device"]'
+	 *   ip -br link
+	 *   ip route get 1.1.1.1
+	 * 常见：wwan0 / usb0 / mhi_hwip0 / rmnet_mhi0.1 / eth1(USB 网卡) / wan
+	 *
+	 * 规则不同，别混：
+	 *   mtketh-wan  -> IS_WAN() 前缀匹配 + dev_get_by_name()，名字要真实存在
+	 *   ext-devices -> strcmp 精确匹配（hnat_nf_hook.c:173），含 ".1" 也要写全
+	 * 有多个接口就全列：ext-devices = "wwan0", "wwan0_1", "usb0";
+	 * ------------------------------------------------------------------ */
+	mtketh-wan = "<WAN_DEV>";
+	ext-devices = "<WAN_DEV>";
+
+	/* LAN 侧：DSA user port 名 "lan"。IS_LAN() 是前缀匹配，填 "lan" 即可 */
+	mtketh-lan = "lan";
+	mtketh-lan2 = "/";		/* 单 GMAC 无第二组 LAN，"/" = unused
+					 * （与 detect.uc:164 的行为一致；
+					 *   留默认 "eth2" 会误把 eth2 判成 LAN2） */
+	mtketh-ppd = "eth0";		/* PPD 必须是精确存在的 GMAC root。
+					 * 本机只有 gmac0 -> eth0，绝不能写 eth1 */
+
+	mtketh-max-gmac = <1>;		/* 必填！缺失会 probe 失败 */
+	mtketh-ppe-num = <1>;		/* 单 GMAC 时 PPE1 不参与 */
+
+	/* ------------------------------------------------------------------
+	 * 【情形 A：5G 模块作 WAN —— 5G CPE 默认，推荐】
+	 *   >>> 不要写 mtkdsa-wan-port <<<
+	 *   WAN 不是 MT7531 的 DSA 口，写了会让 hnat_dsa_is_enable() 为真，
+	 *   PPE 给包打 DSA tag 发往交换机，反而更错。
+	 *
+	 * 【情形 B：WAN 实际是网线口 port@3，5G 模块另有用途】
+	 *   把上面两行改成：
+	 *       mtketh-wan = "wan";
+	 *       ext-devices = "<5G 模块真实接口名>";   // 若它不做 WAN 可整行删除
+	 *   并在此处加：
+	 *       mtkdsa-wan-port = <3>;
+	 * ------------------------------------------------------------------ */
+};
+
+/* =========================================================================
+ * 为什么这份 &hnat 之前加了没效果：
+ *   25.12 的 hnat-detect 会在运行时把解析结果写进
+ *   /sys/kernel/debug/hnat/hnat_{wan,lan,lan2,ppd}_if，覆盖 DTS 初始值；
+ *   它解析不出 5G 模块这种非 GMAC/非 DSA 的 WAN（detect.uc:142-149
+ *   明确 "do NOT touch WAN"），于是保留驱动默认 wan="eth1"——本机没有 eth1。
+ *   方案 1 先删 hnat-detect（01/02/05），这份 DTS 值才是最终生效值。
+ *
+ *   另外：ext-devices 是 probe 期一次性读入，运行时无法新增，
+ *   所以必须写在这里，不能只靠开机脚本。
+ * ========================================================================= */
