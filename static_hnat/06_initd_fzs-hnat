@@ -16,7 +16,9 @@ START=95
 STOP=10
 
 # ---------- 【必须替换】与 03_dts_hnat_append.dts 保持完全一致 ----------
-WAN_DEV="wwan0"          # TODO: 改成 ip -br link / uci get network.wan.device 的真实值
+# 取值依据：`ip route get 1.1.1.1` 的 dev；不是 uci get network.wan.device
+# （本机实测 uci 返回 "wan"，但默认路由走 wwan0）
+WAN_DEV="wwan0"
 LAN_DEV="lan"
 LAN2_DEV="/"
 PPD_DEV="eth0"
@@ -34,18 +36,34 @@ start() {
 	# ---- 1. 重建 rxppd ----
 	# 02_network 已把 rxppd 登记进 br-lan.ports，netifd 会在设备出现时
 	# 自动挂桥；这里只负责创建并 up，master 交给 netifd。
-	if ! ip link show rxppd >/dev/null 2>&1; then
+	#
+	# 兼容性：部分固件的 /sbin/ip 是 BusyBox applet（不支持 `link add`、
+	# 不支持 `-br`、也没有 `bridge` 命令）。所以：
+	#   - 创建优先 `ip link add`；失败则把 dummy 模块自带的 dummy0 改名
+	#     （BusyBox ip 支持 `link set ... name`）
+	#   - 桥成员一律用 sysfs 判断，不依赖 ip/bridge 的实现
+	if [ ! -e /sys/class/net/rxppd ]; then
 		modprobe dummy 2>/dev/null
-		ip link add rxppd type dummy || {
-			logger -t fzs-hnat "ERROR: cannot create rxppd"
-			return 1
-		}
+		if ! ip link add rxppd type dummy 2>/dev/null; then
+			# BusyBox ip 不支持 link add：dummy 模块加载后自带 dummy0，
+			# 用 `link set ... name` 改名（BusyBox 支持 name 参数）
+			if [ -e /sys/class/net/dummy0 ]; then
+				ip link set dummy0 name rxppd 2>/dev/null || {
+					logger -t fzs-hnat "ERROR: dummy0 rename failed"
+					return 1
+				}
+			else
+				logger -t fzs-hnat "ERROR: cannot create rxppd (link add 与 dummy0 回退均失败)"
+				return 1
+			fi
+		fi
 	fi
-	ip link set rxppd up
+	ip link set rxppd up 2>/dev/null
 
 	# 兜底：若 netifd 尚未把 rxppd 挂进桥（例如 network reload 时序），
 	# 手工挂一次；netifd 重建桥时会重新接管。
-	if ! bridge link show dev rxppd 2>/dev/null | grep -q "master $BR"; then
+	# sysfs 的 brif/ 由内核维护，BusyBox / iproute2 通吃。
+	if [ ! -e "/sys/class/net/$BR/brif/rxppd" ]; then
 		ip link set rxppd master "$BR" 2>/dev/null
 	fi
 
@@ -80,4 +98,3 @@ stop() {
 	# 交给 turboacc 和 netifd 管理，避免 service 重启时把流表反复清空。
 	return 0
 }
-
