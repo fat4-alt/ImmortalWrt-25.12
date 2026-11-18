@@ -1,3 +1,0 @@
-	fzs,5gcpe-p5)
-		ucidef_set_interfaces_lan_wan "lan rxppd" wan
-		;;
