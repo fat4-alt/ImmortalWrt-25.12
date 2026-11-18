@@ -1,10 +1,4 @@
 #!/bin/bash
-# ============================================================
-# 薄装配器：本文件不含 0.txt / filogic-.txt / 02_network.txt 的任何内容
-# 三份素材存放在仓库 custom/ 目录，由 $GITHUB_WORKSPACE 取用
-# 执行时机：workflow "Load custom feeds & Update feeds" 步骤，
-#           cd openwrt 之后、feeds update 之前；工作目录 = /workdir/openwrt
-# ============================================================
 set -e
 
 SRC="$GITHUB_WORKSPACE/custom"
@@ -26,10 +20,10 @@ mkdir -p "$DTS_DIR"
 cp "$SRC/0.txt" "$DTS_DIR/mt7981b-fzs-5gcpe-p5.dts"
 
 # ---------- 2/3 filogic-.txt -> 追加设备定义 ----------
-grep -q "define Device/fzs_5gcpe-p5" "$MK" || cat "$SRC/filogic-.txt" >> "$MK"
+grep -q "define Device/fzs_5gcpe-p5" "$MK" || cat "$SRC/f.txt" >> "$MK"
 
 # ---------- 3/3 02_network.txt -> 插入第一个 case（不能覆盖整个脚本） ----------
-python3 - "$SRC/02_network.txt" "$NET" <<'PY'
+python3 - "$SRC/n.txt" "$NET" <<'PY'
 import sys
 frag, target = sys.argv[1], sys.argv[2]
 # 片段通常已带 tab（首行 1 个、其余 2 个）；若上传的是无缩进纯文本，则规范化一次
