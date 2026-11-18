@@ -17,7 +17,7 @@ on:
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
   REPO_BRANCH: openwrt-25.12
-  CONFIG_FILE: .config
+  CONFIG_FILE: custom/0.config
   DIY_SH: custom/diy.sh
   FREE_SPACE: true
   UPLOAD_FIRMWARE: true
