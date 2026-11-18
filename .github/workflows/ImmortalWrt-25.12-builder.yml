@@ -22,8 +22,6 @@ env:
   FREE_SPACE: true
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
-  # ★ 方案 1：5G 模块/拨号后的真实 WAN netdev 名（用户指定 wwan0）
-  WAN_DEV: wwan0
   TZ: Asia/Shanghai
 
 # ============================================================
@@ -95,25 +93,12 @@ jobs:
         
     # --------------------------------------------------------
     # 步骤 6：生成配置文件 (.config)
-    #   ★ 方案 1 注入必须在 make defconfig 之前：
-    #     defconfig 会读 target.mk 的 DEFAULT_PACKAGES 重新生成 .config，
-    #     若那时 hnat-detect 还没删掉，它会被重新拉回来，前面全白改。
-    #   ★ 注入脚本会一并补上 fork 里没有的三个设备文件：
-    #     dts / 02_network 的 fzs 分支 / filogic.mk 的 Device 定义
     # --------------------------------------------------------
     - name: Generate configuration file
       run: |
         cd openwrt
         [ -e $GITHUB_WORKSPACE/$CONFIG_FILE ] && mv $GITHUB_WORKSPACE/$CONFIG_FILE .config
-        echo "=== inject static HNAT (wan_dev=$WAN_DEV) ==="
-        bash "$GITHUB_WORKSPACE/inject_static_hnat.sh"
         make defconfig
-        echo "=== post-defconfig check ==="
-        grep -n 'CONFIG_PACKAGE_hnat-detect' .config || true
-        ! grep -q '^CONFIG_PACKAGE_hnat-detect=y' .config
-        grep -n '^CONFIG_TARGET_mediatek_filogic_DEVICE_fzs_5gcpe-p5=y' .config
-        grep -n '^CONFIG_NET_MEDIATEK_HNAT=y' target/linux/mediatek/filogic/config-6.12
-        echo "=== defconfig OK ==="
 
     # --------------------------------------------------------
     # 步骤 7：下载依赖包
