@@ -17,7 +17,7 @@ fi
 
 # ---------- 1/3 0.txt -> 设备树（文件名须与 DEVICE_DTS 一致） ----------
 mkdir -p "$DTS_DIR"
-cp "$SRC/0.txt" "$DTS_DIR/mt7981b-fzs-5gcpe-p5.dts"
+cp "$SRC/d.txt" "$DTS_DIR/mt7981b-fzs-5gcpe-p5.dts"
 
 # ---------- 2/3 filogic-.txt -> 追加设备定义 ----------
 grep -q "define Device/fzs_5gcpe-p5" "$MK" || cat "$SRC/f.txt" >> "$MK"
