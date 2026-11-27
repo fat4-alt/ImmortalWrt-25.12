@@ -87,8 +87,7 @@ struct mtk_extdev_flow {
 
 	unsigned long		last_used;
 	u64			inject_pkts;
-	u64			hw_pkts;
-	u64			last_inject;
+	u64			last_inject;	/* inject_pkts snapshot at last GC */
 	u8			stale;		/* HW not consuming -> retire */
 	u8			pending_remove;
 };

@@ -54,14 +54,38 @@
 #include "mtk_wed.h"
 #include "mtk_ppe_extdev.h"
 
-/* Some OpenWrt 25.12 / 6.12.118 vendor trees expose this in mtk_ppe.c but
- * not always through the header chain that reaches this translation unit.
- * The signature is identical to upstream v6.12.118 (mtk_ppe.c:851), so a
- * redundant declaration here is legal C and harmless when the header one is
- * present. */
-extern struct mtk_foe_accounting *
-mtk_foe_entry_get_mib(struct mtk_ppe *ppe, u32 index,
-		      struct mtk_foe_accounting *diff);
+/* Hardware-slot liveness check WITHOUT any external function symbol.
+ *
+ * v3 used mtk_foe_entry_get_mib() for stale detection, but in the
+ * OpenWrt 25.12 / linux-6.12.118 build that symbol has no linkable
+ * definition in the final vmlinux (it is not EXPORT_SYMBOL'd and the
+ * stats path that references it is compiled out), so ld fails with
+ * "undefined reference to mtk_foe_entry_get_mib".
+ *
+ * Instead read the FOE table entry directly. mtk_foe_get_entry() is a
+ * static inline in mtk_eth_soc.h:1341 (ppe->foe_table + hash * foe_entry_size)
+ * and MTK_FOE_IB1_STATE / MTK_FOE_STATE_BIND come from mtk_ppe.h. Both are
+ * header-only -> zero linker dependencies.
+ *
+ * Semantics: PPE hardware refreshes/keeps a used slot in BIND state; a slot
+ * that is never hit is aged out to INVALID by the PPE scan mode configured
+ * in mtk_ppe_start(). If we keep injecting but the slot is no longer BIND,
+ * the injected packets are NOT being consumed by hardware -> retire the flow
+ * and fall back to the software path. */
+static bool mtk_extdev_hw_slot_alive(struct mtk_ppe *ppe, u16 hash)
+{
+	struct mtk_foe_entry *hwe;
+
+	if (!ppe || !ppe->foe_table || hash == 0xffff)
+		return false;
+
+	hwe = mtk_foe_get_entry(ppe, hash);
+	if (!hwe)
+		return false;
+
+	return FIELD_GET(MTK_FOE_IB1_STATE, READ_ONCE(hwe->ib1)) ==
+	       MTK_FOE_STATE_BIND;
+}
 
 static char *extdev_prefix = "wwan,usb,eth2";
 module_param(extdev_prefix, charp, 0644);
@@ -493,10 +517,11 @@ static const struct nf_hook_ops mtk_extdev_nf_ops[] = {
  * If the QDMA/PSE forward-port trick does not make the PPE consume our
  * packets on a given SoC (netsys version differences), a naive implementation
  * black-holes the connection: "ping works, TCP/UDP dead" (a well-known
- * symptom with external-device HNAT). Guard against it: compare injected
- * packets with the hardware MIB counter of the FOE slot. If injections keep
- * growing while the hardware counter does not, retire the flow and fall back
- * to the software path. Never silently lose traffic.
+ * symptom with external-device HNAT). Guard against it: read the FOE slot's
+ * IB1 state directly (header-only inline, no external symbol). If we keep
+ * injecting but the slot is no longer BIND, hardware is not consuming our
+ * packets -> retire the flow and fall back to software. Never silently lose
+ * traffic.
  * ------------------------------------------------------------------ */
 
 static void mtk_extdev_gc(struct timer_list *t)
@@ -504,7 +529,6 @@ static void mtk_extdev_gc(struct timer_list *t)
 	struct mtk_extdev *ed = from_timer(ed, t, gc);
 	struct mtk_extdev_flow *f;
 	struct rhashtable_iter it;
-	struct mtk_foe_accounting diff;
 	unsigned long doomed[64];
 	int i, ndoomed = 0;
 
@@ -517,42 +541,30 @@ static void mtk_extdev_gc(struct timer_list *t)
 	 * rhashtable documentation forbids it (may skip / revisit objects).
 	 * Collect cookies, then delete after walk_stop(). */
 	while ((f = rhashtable_walk_next(&it)) != NULL) {
-		u64 prev_inj, prev_hw;
-		bool mib_ok = false, retire = false;
+		u64 prev_inj;
+		bool alive, retire = false;
 
 		if (IS_ERR(f))
 			continue;
 
 		prev_inj = f->last_inject;
-		prev_hw  = f->hw_pkts;
 		f->last_inject = f->inject_pkts;
 
-		memset(&diff, 0, sizeof(diff));
-		/* mtk_foe_entry_get_mib() returns the DELTA since the last read
-		 * (and clears the hardware counter), not a cumulative total. */
-		if (f->foe && f->foe->hash != 0xffff &&
-		    mtk_foe_entry_get_mib(ed->eth->ppe[f->ppe_index],
-					  f->foe->hash, &diff)) {
-			f->hw_pkts += diff.packets;
-			mib_ok = true;
-		}
-
-		/* Only judge staleness when the MIB is actually available and
-		 * traffic kept being injected during this interval. Otherwise a
-		 * build without PPE accounting would retire every flow. */
-		if (mib_ok && prev_inj && f->inject_pkts > prev_inj) {
-			if (f->hw_pkts > prev_hw) {
-				f->stale = 0;		/* hardware is consuming */
-			} else if (++f->stale >= MTK_EXTDEV_STALE_LIMIT) {
+		alive = mtk_extdev_hw_slot_alive(ed->eth->ppe[f->ppe_index],
+						 f->foe_hash);
+		if (alive) {
+			/* Slot still BIND: hardware owns this flow. */
+			f->stale = 0;
+		} else if (prev_inj && f->inject_pkts > prev_inj) {
+			/* We are injecting, but the hardware slot is gone. */
+			if (++f->stale >= MTK_EXTDEV_STALE_LIMIT) {
 				netdev_warn(f->odev,
-					"extdev: PPE slot %u not consuming injected "
-					"traffic, retiring flow (software fallback)\n",
+					"extdev: PPE slot %u not BIND while injecting, "
+					"retiring flow (software fallback)\n",
 					f->foe_hash);
 				ed->stale_out++;
 				retire = true;
 			}
-		} else if (!mib_ok) {
-			f->stale = 0;
 		}
 
 		if (!retire &&
