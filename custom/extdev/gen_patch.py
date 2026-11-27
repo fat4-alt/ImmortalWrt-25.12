@@ -110,7 +110,6 @@ int mtk_foe_entry_bind_hw(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
 
 \treturn (int)hash;
 }
-EXPORT_SYMBOL_GPL(mtk_foe_entry_bind_hw);
 
 static void
 mtk_foe_entry_commit_subflow(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
@@ -123,11 +122,12 @@ mtk_foe_entry_commit_subflow(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
 
 \tfor (i = 0; i < ARRAY_SIZE(eth->ppe); i++) {
 """,
-     """void mtk_ppe_deinit(struct mtk_eth *eth)
+     """extern void mtk_ppe_extdev_deinit(struct mtk_eth *eth);
+
+void mtk_ppe_deinit(struct mtk_eth *eth)
 {
 \tint i;
 
-\textern void mtk_ppe_extdev_deinit(struct mtk_eth *eth);
 \tif (IS_ENABLED(CONFIG_NET_MEDIATEK_PPE_EXTDEV))
 \t\tmtk_ppe_extdev_deinit(eth);
 
@@ -246,6 +246,7 @@ and mtk_ppe_extdev_tx.c must be present in the same directory.
 
 def dry_run(src, patch_path):
     """Apply the generated patch to a throwaway copy with `patch --dry-run`."""
+    patch_path = os.path.abspath(patch_path)
     with tempfile.TemporaryDirectory() as td:
         d = os.path.join(td, "drivers/net/ethernet/mediatek")
         os.makedirs(d)

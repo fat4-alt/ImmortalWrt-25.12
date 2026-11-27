@@ -29,6 +29,11 @@
 
 #include <linux/percpu.h>
 
+/* Forward declarations: this file is #included into mtk_eth_soc.c, so its own
+ * prototypes are not otherwise visible (kernel -Wmissing-prototypes). */
+u8 mtk_extdev_get_fport(void);
+int mtk_ppe_extdev_inject(struct mtk_eth *eth, struct sk_buff *skb);
+
 #if IS_ENABLED(CONFIG_NET_MEDIATEK_PPE_EXTDEV)
 
 DEFINE_PER_CPU(u8, mtk_extdev_fport);
@@ -100,7 +105,6 @@ int mtk_ppe_extdev_inject(struct mtk_eth *eth, struct sk_buff *skb)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(mtk_ppe_extdev_inject);
 
 #else  /* !CONFIG_NET_MEDIATEK_PPE_EXTDEV */
 

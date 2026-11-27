@@ -34,6 +34,7 @@
 #if IS_ENABLED(CONFIG_NET_MEDIATEK_PPE_EXTDEV)
 
 #include <linux/debugfs.h>
+#include <linux/etherdevice.h>
 #include <linux/jhash.h>
 #include <linux/ip.h>
 #include <linux/moduleparam.h>
@@ -52,6 +53,15 @@
 #include "mtk_ppe.h"
 #include "mtk_wed.h"
 #include "mtk_ppe_extdev.h"
+
+/* Some OpenWrt 25.12 / 6.12.118 vendor trees expose this in mtk_ppe.c but
+ * not always through the header chain that reaches this translation unit.
+ * The signature is identical to upstream v6.12.118 (mtk_ppe.c:851), so a
+ * redundant declaration here is legal C and harmless when the header one is
+ * present. */
+extern struct mtk_foe_accounting *
+mtk_foe_entry_get_mib(struct mtk_ppe *ppe, u32 index,
+		      struct mtk_foe_accounting *diff);
 
 static char *extdev_prefix = "wwan,usb,eth2";
 module_param(extdev_prefix, charp, 0644);
@@ -100,7 +110,10 @@ mtk_extdev_skb_key(struct sk_buff *skb, struct mtk_extdev_key *k)
 	iph = ip_hdr(skb);
 	if (iph->version != 4 || iph->ihl < 5)
 		return false;
-	if (iph->frag_off & htons(IP_MF | IP_OFFSET))
+	/* IP_MF (0x2000) | IP_OFFSET (0x1FFF) == 0x3FFF. Those macros live in
+	 * <net/ip.h>, which pulls in a lot of conntrack/ipstack internals;
+	 * use the numeric value so this file stays header-light. */
+	if (iph->frag_off & htons(0x3fff))
 		return false;
 	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
 		return false;
@@ -240,6 +253,8 @@ static int mtk_extdev_learn(struct mtk_extdev *ed, struct sk_buff *skb,
 	 * validation: it returns -EOPNOTSUPP for anything that is not a WDMA
 	 * path, a MTK DSA user port, or one of eth->netdev[0..2]. Do not
 	 * pre-validate here (dev_fill_forward_path needs a real daddr). */
+	if (!skb_dst(skb))
+		return -ENODEV;
 	neigh = dst_neigh_lookup(skb_dst(skb), &iph->daddr);
 	if (!neigh || is_zero_ether_addr(neigh->ha)) {
 		if (neigh)
@@ -489,18 +504,21 @@ static void mtk_extdev_gc(struct timer_list *t)
 	struct mtk_extdev *ed = from_timer(ed, t, gc);
 	struct mtk_extdev_flow *f;
 	struct rhashtable_iter it;
-	struct mtk_foe_accounting diff = {};
+	struct mtk_foe_accounting diff;
+	unsigned long doomed[64];
+	int i, ndoomed = 0;
 
+	/* rhashtable_walk_start() returns VOID in 6.12 (it used to return int
+	 * in older kernels). Do not test its return value. */
 	rhashtable_walk_enter(&ed->flows, &it);
-	if (rhashtable_walk_start(&it) != 0) {
-		rhashtable_walk_exit(&it);
-		mod_timer(&ed->gc, jiffies + MTK_EXTDEV_GC_INTERVAL);
-		return;
-	}
+	rhashtable_walk_start(&it);
 
+	/* Two-phase: never remove entries while the walker is active -- the
+	 * rhashtable documentation forbids it (may skip / revisit objects).
+	 * Collect cookies, then delete after walk_stop(). */
 	while ((f = rhashtable_walk_next(&it)) != NULL) {
 		u64 prev_inj, prev_hw;
-		bool mib_ok = false;
+		bool mib_ok = false, retire = false;
 
 		if (IS_ERR(f))
 			continue;
@@ -509,6 +527,7 @@ static void mtk_extdev_gc(struct timer_list *t)
 		prev_hw  = f->hw_pkts;
 		f->last_inject = f->inject_pkts;
 
+		memset(&diff, 0, sizeof(diff));
 		/* mtk_foe_entry_get_mib() returns the DELTA since the last read
 		 * (and clears the hardware counter), not a cumulative total. */
 		if (f->foe && f->foe->hash != 0xffff &&
@@ -520,7 +539,7 @@ static void mtk_extdev_gc(struct timer_list *t)
 
 		/* Only judge staleness when the MIB is actually available and
 		 * traffic kept being injected during this interval. Otherwise a
-		 * build without CONFIG PPE accounting would retire every flow. */
+		 * build without PPE accounting would retire every flow. */
 		if (mib_ok && prev_inj && f->inject_pkts > prev_inj) {
 			if (f->hw_pkts > prev_hw) {
 				f->stale = 0;		/* hardware is consuming */
@@ -529,21 +548,28 @@ static void mtk_extdev_gc(struct timer_list *t)
 					"extdev: PPE slot %u not consuming injected "
 					"traffic, retiring flow (software fallback)\n",
 					f->foe_hash);
-				mtk_extdev_flow_del(ed, f->cookie);
 				ed->stale_out++;
-				continue;
+				retire = true;
 			}
 		} else if (!mib_ok) {
 			f->stale = 0;
 		}
 
-		if (time_after(jiffies, f->last_used + MTK_EXTDEV_FLOW_TIMEOUT)) {
-			mtk_extdev_flow_del(ed, f->cookie);
+		if (!retire &&
+		    time_after(jiffies, f->last_used + MTK_EXTDEV_FLOW_TIMEOUT)) {
 			ed->aged_out++;
+			retire = true;
 		}
+
+		if (retire && ndoomed < ARRAY_SIZE(doomed))
+			doomed[ndoomed++] = f->cookie;
 	}
 	rhashtable_walk_stop(&it);
 	rhashtable_walk_exit(&it);
+
+	for (i = 0; i < ndoomed; i++)
+		mtk_extdev_flow_del(ed, doomed[i]);
+
 	mod_timer(&ed->gc, jiffies + MTK_EXTDEV_GC_INTERVAL);
 }
 
@@ -563,7 +589,9 @@ static int mtk_extdev_bind(struct mtk_extdev *ed, struct net_device *dev,
 	if (!mtk_extdev_is_candidate(ed, dev))
 		return 0;
 
-	list_for_each_entry_rcu(p, &ed->ports, list)
+	/* Called under rtnl_mutex (notifier / init sweep), so a plain
+	 * list_for_each_entry is sufficient and avoids a lockdep RCU warning. */
+	list_for_each_entry(p, &ed->ports, list)
 		if (p->dev == dev)
 			return 0;
 
@@ -574,6 +602,7 @@ static int mtk_extdev_bind(struct mtk_extdev *ed, struct net_device *dev,
 	if (!p)
 		return -ENOMEM;
 	p->dev = dev;
+	p->ed = ed;		/* rx_handler_data = p; rx_handler needs ed back */
 	strscpy(p->name, dev->name, sizeof(p->name));
 	dev_hold(dev);
 
@@ -721,12 +750,11 @@ void mtk_ppe_extdev_deinit(struct mtk_eth *eth)
 
 	rhashtable_walk_enter(&ed->flows, &it);
 	rhashtable_walk_start(&it);
+	/* Only free the objects here. Removing from ed->flows while walking is
+	 * forbidden; rhashtable_destroy() below discards the whole table. */
 	while ((f = rhashtable_walk_next(&it)) != NULL) {
-		if (!IS_ERR(f)) {
-			rhashtable_remove_fast(&ed->flows, &f->node,
-					       mtk_extdev_flow_ht_params);
+		if (!IS_ERR(f))
 			mtk_extdev_flow_free(ed, f);
-		}
 	}
 	rhashtable_walk_stop(&it);
 	rhashtable_walk_exit(&it);
@@ -743,6 +771,5 @@ void mtk_ppe_extdev_deinit(struct mtk_eth *eth)
 	rtnl_unlock();
 	kfree(ed);
 }
-EXPORT_SYMBOL_GPL(mtk_ppe_extdev_deinit);
 
 #endif /* CONFIG_NET_MEDIATEK_PPE_EXTDEV */

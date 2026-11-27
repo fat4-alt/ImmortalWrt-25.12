@@ -45,6 +45,7 @@
 
 struct mtk_eth;
 struct mtk_flow_entry;
+struct mtk_extdev;
 struct dentry;
 
 /* cookie space separation: mainline nft flowtable cookies come from nf_flowtable
@@ -96,6 +97,7 @@ struct mtk_extdev_port {
 	struct list_head	list;
 	struct rcu_head		rcu;
 	struct net_device	*dev;
+	struct mtk_extdev	*ed;	/* rx_handler_data 只存 port，需要自带上下文 */
 	char			name[IFNAMSIZ];
 };
 
