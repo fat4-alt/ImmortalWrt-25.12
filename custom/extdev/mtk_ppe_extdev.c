@@ -14,7 +14,8 @@
  *   packet #1  wwan0 -> rx_handler (no entry) -> RX_HANDLER_PASS
  *              -> ip_rcv -> conntrack + SNAT -> POST_ROUTING hook
  *              -> build HNAPT FOE entry (orig = conntrack REPLY tuple,
- *                 new = post-NAT iphdr, egress = DSA / GDM / WDMA)
+ *                 new = post-NAT iphdr, egress = DSA / GDM only;
+ *                 WDMA/WED egress is refused by default -- see below)
  *              -> mtk_foe_entry_commit()   (software hash bucket)
  *              -> mtk_foe_entry_bind_hw()  (write the actual hardware slot)
  *              -> register key in extdev rhashtable
@@ -98,6 +99,29 @@ static bool extdev_enable = true;
 module_param(extdev_enable, bool, 0644);
 MODULE_PARM_DESC(extdev_enable,
 	"set to 0 to fall back to software forwarding without reflashing");
+
+/* === Wireless egress: OFF by default ==================================
+ *
+ * Symptom on MT7981B: with WED enabled, a FOE entry whose IB2.DEST_PORT is
+ * PSE_WDMA0/1/2_PORT and which is bound straight into hardware by
+ * mtk_foe_entry_bind_hw() makes the PPE push packets to a WDMA TX ring that
+ * mt76/mtk_wed has not set up for this flow. Mainline avoids that by letting
+ * the PPE send the first packet back to the CPU, where
+ * __mtk_ppe_check_skb() completes the WED-side learning; bind_hw() skips
+ * that step. Result: WED/WDMA hang -> mt7915e firmware watchdog -> WiFi
+ * resets in a loop.
+ *
+ * Therefore this layer NEVER builds a WDMA FOE entry unless explicitly
+ * allowed. USB/5G -> WiFi then stays on the software flowtable (still fast,
+ * still correct), while USB/5G -> wired LAN keeps genuine PPE offload.
+ * Mainline's own Ethernet-WAN -> WiFi WED offload is untouched.
+ *
+ * Runtime: echo 1 > /sys/module/mtk_eth/parameters/extdev_wireless
+ * (NOT recommended until verified on your exact SoC/firmware). */
+static bool extdev_wireless;
+module_param(extdev_wireless, bool, 0644);
+MODULE_PARM_DESC(extdev_wireless,
+	"allow USB/5G -> WiFi WDMA FOE entries (default 0, may reset WiFi)");
 
 const struct rhashtable_params mtk_extdev_flow_ht_params = {
 	.head_offset		= offsetof(struct mtk_extdev_flow, node),
@@ -247,6 +271,14 @@ static int mtk_extdev_learn(struct mtk_extdev *ed, struct sk_buff *skb,
 	u8 src_mac[ETH_ALEN], dst_mac[ETH_ALEN];
 	int wed_index = -1, ppe_index = 0, slot = -1, err;
 
+	/* Startup gate: do not touch FOE hardware before mtk_ppe_start() has run.
+	 * learn() is reached from a POST_ROUTING hook that is registered during
+	 * probe; a 5G modem can already be pushing traffic at that point. Writing
+	 * a BIND entry into a PPE that has not been started is a reliable way to
+	 * panic the box into a watchdog reset loop. */
+	if (unlikely(!READ_ONCE(ed->hw_ready)))
+		return -EOPNOTSUPP;
+
 	/* Only IPv4 TCP/UDP for now. Everything else stays on the CPU. */
 	if (!mtk_extdev_skb_key(skb, &key))
 		return -EOPNOTSUPP;
@@ -309,10 +341,23 @@ static int mtk_extdev_learn(struct mtk_extdev *ed, struct sk_buff *skb,
 		return err;
 
 	/* Handles WDMA (wireless WED), DSA user ports and plain GDM,
-	 * including queue selection. This is the mainline helper. */
+	 * including queue selection. This is the mainline helper. It only fills
+	 * `foe` -- it has no external side effects, so bailing out below is
+	 * safe (no mtk_wed_flow_add() has run yet). */
 	err = mtk_flow_set_output_device(eth, &foe, odev, dst_mac, &wed_index);
 	if (err)
 		return err;
+
+	/* *** Do NOT offload wireless egress from this layer ***
+	 * A WDMA-bound FOE written straight into hardware by bind_hw() skips
+	 * the WED-side learning that __mtk_ppe_check_skb() would do, and makes
+	 * the PPE push to a WDMA ring mt76 has not prepared. That resets WiFi.
+	 * Leave USB/5G -> WiFi on the software path; wired egress still gets
+	 * real PPE offload. */
+	if (wed_index >= 0 && !extdev_wireless) {
+		ed->wireless_skip++;
+		return -EOPNOTSUPP;
+	}
 
 	if (wed_index >= 0) {
 		err = mtk_wed_flow_add(wed_index);
@@ -416,6 +461,11 @@ mtk_extdev_rx_handler(struct sk_buff **pskb)
 		return RX_HANDLER_PASS;
 	ed = p->ed;
 	ed->rx_total++;
+
+	/* Before the GMAC netdev comes UP, mtk_ppe_start() has not run and the
+	 * QDMA TX ring is not allocated. Never inject in that window. */
+	if (unlikely(!READ_ONCE(ed->hw_ready)))
+		goto pass;
 
 	if (unlikely(!extdev_enable))
 		goto pass;
@@ -532,6 +582,13 @@ static void mtk_extdev_gc(struct timer_list *t)
 	unsigned long doomed[64];
 	int i, ndoomed = 0;
 
+	/* Startup gate. The GC reads hardware FOE table memory every second;
+	 * doing that before mtk_ppe_start() is unsafe. Just re-arm the timer. */
+	if (unlikely(!READ_ONCE(ed->hw_ready))) {
+		mod_timer(&ed->gc, jiffies + MTK_EXTDEV_GC_INTERVAL);
+		return;
+	}
+
 	/* rhashtable_walk_start() returns VOID in 6.12 (it used to return int
 	 * in older kernels). Do not test its return value. */
 	rhashtable_walk_enter(&ed->flows, &it);
@@ -643,11 +700,42 @@ err_put:
 	return err;
 }
 
+/* Is this one of the GMAC netdevs owned by mtk_eth_soc itself? A NETDEV_UP on
+ * such a device is the only reliable signal that mtk_open() has finished:
+ *   mtk_open() -> mtk_start_dma() -> mtk_dma_init() -> mtk_tx_alloc()
+ *              -> mtk_ppe_start()  (PPE hardware now live)
+ *   then the netdev core emits NETDEV_UP.
+ * That is the point where it becomes safe to write FOE entries / submit QDMA
+ * TX descriptors. Before that, the PPE is not started and the TX ring is not
+ * allocated; touching either panics the box into a watchdog reset loop. */
+static bool mtk_extdev_is_ppe_netdev(struct mtk_extdev *ed,
+				     struct net_device *dev)
+{
+	int i;
+
+	for (i = 0; i < MTK_MAX_DEVS; i++)
+		if (ed->eth->netdev[i] == dev)
+			return true;
+	return false;
+}
+
 static int mtk_extdev_netdev_event(struct notifier_block *nb,
 				   unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct mtk_extdev *ed = container_of(nb, struct mtk_extdev, nb);
+
+	if (mtk_extdev_is_ppe_netdev(ed, dev)) {
+		if (event == NETDEV_UP) {
+			WRITE_ONCE(ed->hw_ready, 1);
+			/* Arm the GC now that the PPE is started; mod_timer() is
+			 * idempotent, so repeated UP events are harmless. */
+			mod_timer(&ed->gc, jiffies + MTK_EXTDEV_GC_INTERVAL);
+			netdev_info(dev, "extdev: PPE/DMA ready, injection enabled\n");
+		} else if (event == NETDEV_DOWN || event == NETDEV_GOING_DOWN) {
+			WRITE_ONCE(ed->hw_ready, 0);
+		}
+	}
 
 	if (event == NETDEV_REGISTER || event == NETDEV_UP)
 		mtk_extdev_bind(ed, dev, true);
@@ -674,7 +762,7 @@ int mtk_ppe_extdev_init(struct mtk_eth *eth)
 {
 	struct mtk_extdev *ed;
 	struct net_device *dev;
-	int err;
+	int err, i;
 
 	if (!eth->ppe[0] || !eth->ppe[0]->foe_table)
 		return 0;		/* no PPE on this SoC */
@@ -691,6 +779,10 @@ int mtk_ppe_extdev_init(struct mtk_eth *eth)
 	if (!ed)
 		return -ENOMEM;
 	ed->eth = eth;
+	/* kzalloc already zeroed it; be explicit: init runs in the PROBE path,
+	 * long before any GMAC netdev is UP. All hardware access stays gated
+	 * until mtk_extdev_netdev_event() sees NETDEV_UP on eth->netdev[]. */
+	WRITE_ONCE(ed->hw_ready, 0);
 	INIT_LIST_HEAD(&ed->ports);
 	spin_lock_init(&ed->lock);
 	strscpy(ed->prefix, extdev_prefix, sizeof(ed->prefix));
@@ -707,8 +799,11 @@ int mtk_ppe_extdev_init(struct mtk_eth *eth)
 	if (err)
 		goto err_notifier;
 
+	/* Deliberately NOT mod_timer() here. The GC touches FOE hardware memory;
+	 * it is armed by mtk_extdev_netdev_event() on the first NETDEV_UP of a
+	 * PPE-owned GMAC, i.e. after mtk_ppe_start(). timer_setup() alone is
+	 * harmless (no callback runs), and deinit's del_timer_sync() is safe. */
 	timer_setup(&ed->gc, mtk_extdev_gc, 0);
-	mod_timer(&ed->gc, jiffies + MTK_EXTDEV_GC_INTERVAL);
 
 	ed->dbg = debugfs_create_dir("mtk_ppe_extdev", NULL);
 	debugfs_create_u64("rx_total",  0444, ed->dbg, &ed->rx_total);
@@ -720,6 +815,8 @@ int mtk_ppe_extdev_init(struct mtk_eth *eth)
 	debugfs_create_u64("stale_out", 0444, ed->dbg, &ed->stale_out);
 	debugfs_create_u64("tx_busy",   0444, ed->dbg, &ed->tx_busy);
 	debugfs_create_u64("tx_fail",   0444, ed->dbg, &ed->tx_fail);
+	debugfs_create_u64("wireless_skip", 0444, ed->dbg, &ed->wireless_skip);
+	debugfs_create_u8("hw_ready", 0444, ed->dbg, &ed->hw_ready);
 
 	eth->extdev = ed;
 
@@ -727,11 +824,27 @@ int mtk_ppe_extdev_init(struct mtk_eth *eth)
 	rtnl_lock();
 	for_each_netdev(&init_net, dev)
 		mtk_extdev_bind(ed, dev, true);
+
+	/* Edge case: a GMAC may already be UP before this notifier is registered
+	 * (no further NETDEV_UP would arrive). Only open the gate when the
+	 * netdev is genuinely running -- at that point mtk_open() has already
+	 * completed mtk_start_dma() + mtk_ppe_start(), so hardware is live. */
+	for (i = 0; i < MTK_MAX_DEVS; i++) {
+		struct net_device *gdev = eth->netdev[i];
+
+		if (gdev && netif_running(gdev)) {
+			WRITE_ONCE(ed->hw_ready, 1);
+			mod_timer(&ed->gc, jiffies + MTK_EXTDEV_GC_INTERVAL);
+			break;
+		}
+	}
 	rtnl_unlock();
 
-	pr_info("mtk_ppe_extdev: USB/5G -> wired/wireless PPE injection ready "
-		"(prefix=%s, WED=%d)\n", ed->prefix,
-		IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED));
+	pr_info("mtk_ppe_extdev: registered (probe), hw_ready=%d, "
+		"PSE_PPE0_PORT injection gated until GMAC NETDEV_UP "
+		"(prefix=%s, WED_compiled=%d, wireless_egress=%d)\n",
+		READ_ONCE(ed->hw_ready), ed->prefix,
+		IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED), extdev_wireless);
 	return 0;
 
 err_notifier:
@@ -753,6 +866,7 @@ void mtk_ppe_extdev_deinit(struct mtk_eth *eth)
 	if (!ed)
 		return;
 	eth->extdev = NULL;
+	WRITE_ONCE(ed->hw_ready, 0);
 
 	del_timer_sync(&ed->gc);
 	unregister_netdevice_notifier(&ed->nb);

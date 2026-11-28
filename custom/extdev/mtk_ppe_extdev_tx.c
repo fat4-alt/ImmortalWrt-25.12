@@ -69,6 +69,16 @@ int mtk_ppe_extdev_inject(struct mtk_eth *eth, struct sk_buff *skb)
 	if (unlikely(!dev))
 		return -ENODEV;
 
+	/* Startup gate (translation-unit-local equivalent of ed->hw_ready).
+	 * mtk_ppe_extdev_init() runs in the PROBE path, before register_netdev()
+	 * and before mtk_open() allocates the QDMA TX ring / starts the PPE.
+	 * netif_running() only becomes true once ndo_open succeeded, which is
+	 * the same point where the notifier sets ed->hw_ready. Without this,
+	 * an early modem packet could submit a descriptor to an unallocated
+	 * ring and panic the box into a watchdog reset loop. */
+	if (unlikely(!netif_running(dev)))
+		return -EAGAIN;
+
 	if (unlikely(test_bit(MTK_RESETTING, &eth->state)))
 		return -ENETDOWN;
 

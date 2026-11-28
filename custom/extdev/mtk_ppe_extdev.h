@@ -111,6 +111,15 @@ struct mtk_extdev {
 	unsigned int		nr_ports;
 	char			prefix[MTK_EXTDEV_PREFIX_MAX];
 
+	/* Startup gate. mtk_ppe_extdev_init() runs from mtk_eth_offload_init()
+	 * in the PROBE path (mtk_eth_soc.c:5121), which is BEFORE register_netdev
+	 * (:5148), before mtk_tx_alloc() (only in ndo_open) and before
+	 * mtk_ppe_start() (:3470). Touching FOE hardware / QDMA TX in that window
+	 * panics the kernel on a watchdog reset loop. Only a NETDEV_UP on one of
+	 * eth->netdev[] (which happens after mtk_open() -> mtk_start_dma() ->
+	 * mtk_ppe_start() completed) is allowed to open the gate. */
+	u8			hw_ready;
+
 	/* counters, exported via debugfs */
 	u64	rx_total;
 	u64	rx_inject;
@@ -122,6 +131,7 @@ struct mtk_extdev {
 	u64	stale_out;
 	u64	tx_busy;
 	u64	tx_fail;
+	u64	wireless_skip;		/* WiFi egress left on software path */
 };
 
 /* ---- implemented in mtk_ppe_extdev_tx.c, included by mtk_eth_soc.c ------- */

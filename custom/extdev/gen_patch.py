@@ -43,14 +43,18 @@ REPLACEMENTS = [
      "config NET_MEDIATEK_STAR_EMAC\n",
      """config NET_MEDIATEK_PPE_EXTDEV
 \tbool "PPE external-device (USB/5G modem) downlink offload"
-\tdepends on NET_MEDIATEK_SOC && NF_CONNTRACK && NF_CONNTRACK_EVENTS
+\tdepends on NET_MEDIATEK_SOC
 \tdepends on NET_MEDIATEK_SOC_WED
 \thelp
 \t  Downlink-only PPE offload for a USB-attached 5G modem acting as WAN.
 \t  Matched packets are re-injected into the PPE through a QDMA TX
 \t  descriptor whose forward port is PSE_PPE0_PORT. FOE entries reuse the
 \t  mainline DSA / GDM / WDMA egress encoders. Uplink stays on the CPU.
-\t  Non-upstreamable. Requires wed_enable=Y on the mt76 wifi driver.
+\t  WED is enabled by default on filogic (mt76 MODPARAMS); this option
+\t  does not change any WED or flow-offload default. Conntrack is provided
+\t  by firewall4 -> kmod-nft-offload -> kmod-nf-flow at build time, so it
+\t  is intentionally NOT a Kconfig dependency (generic config has it off).
+\t  Non-upstreamable.
 
 config NET_MEDIATEK_STAR_EMAC
 """),
