@@ -42,7 +42,7 @@ set -e
 # ---------------- 可调开关 ----------------
 TARGET_REPO="https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git"
 TARGET_BRANCH="25.12"
-SWITCH_SOURCE=0          # 0 = 只做后面的自定义，不切源（已改 workflow 时用）
+SWITCH_SOURCE=1          # 0 = 只做后面的自定义，不切源（已改 workflow 时用）
 
 DO_BRAND=1               # 改默认管理 IP / 品牌
 DO_BOARD=1               # 注入 d.txt / f.txt / n.txt 设备片段
