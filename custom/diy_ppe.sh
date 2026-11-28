@@ -1,189 +1,206 @@
 #!/bin/bash
 # ============================================================
-#  custom/diy.sh  ——  ImmortalWrt 25.12 / MT7981B 5G CPE
+#  diy_ppe.sh —— 云编译切换为 chasey-dev / immortalwrt-mt798x-rebase
 #
-#  基于原 custom/diy.sh 重写：
-#    x 不含 SONiC fullcone（不打 984~987 内核补丁、不删 firewall4 依赖、
-#      不替换 NAT 栈、不默认全开 fullcone、不 restart firewall）
-#    + 加入 USB/5G 模组 → 有线/无线 PPE 硬件加速（custom/extdev/ 实现包）
-#    + 修复「刷机后拿不到内网 IP / 进不了后台 / 无法联网」
-#    + 脚本自包含健壮性：空片段不崩、不写空 DTS、不破坏板级网络配置
+#  用途：把 P3TERX 风格 workflow 默认 clone 的
+#          immortalwrt/immortalwrt  @ openwrt-25.12
+#        在 diy 阶段「原地」切成
+#          chasey-dev/immortalwrt-mt798x-rebase @ 25.12
+#        并只保留与这套源码树兼容的少量自定义。
 #
-#  ★ v6 重新确认（重要，改掉前几版的错误认知）：
-#    wed_enable 与 ppe_hw_offload 在 ImmortalWrt 25.12 filogic 上本来就是
-#    **默认开启**的，本脚本一律不碰：
-#      - package/kernel/mt76/Makefile:242 对 mediatek_filogic 无条件设置
-#        MODPARAMS.mt7915e:=wed_enable=Y（包自带，删 files/ 下的文件关不掉）
-#      - filogic/config-6.12:327 本来就是 CONFIG_NET_MEDIATEK_SOC_WED=y
-#      - firewall.config 默认 option flow_offloading 1；firewall4 硬依赖
-#        +kmod-nft-offload，CONFIG_NF_FLOW_TABLE_HW_OFFLOAD 由包层 override
-#        打开，不是 kernel config 片段
-#    所以：不写 modules.d/50-mtk-ppe-wed、不写 flow_offloading* uci-defaults、
-#    不改这三个内核符号。只写 extdev 自己新增的 CONFIG_NET_MEDIATEK_PPE_EXTDEV。
-#    （v5 里 "rm 50-mtk-ppe-wed 关闭 WED" 是无效操作，WED 一直开着。）
+#  ★ 相对上一版（主线 mtk_ppe / extdev 版）删掉了什么：
+#    - custom/extdev/ 的内核补丁、3 个 .c、Kconfig 写入
+#      （chasey-dev 自带 mtk_hnat + mt_wifi，主线 extdev 打上去必失败）
+#    - 全部内核 config 写入（NET_MEDIATEK_SOC_WED / NF_FLOW_TABLE* /
+#      NF_CONNTRACK / PPE_EXTDEV 一个都不写）
+#    - modules.d、以及所有改写防火墙加速开关的 uci-defaults
+#    - 主线 PPE 的验证判据（ppe0/bind 那套）
+#    ★ 按要求：本脚本内完全不出现、不读写任何防火墙加速开关，
+#      它是开是关、是否冲突，全部交给 chasey-dev 源码树自身的默认。
 #
-#  ★ v6 修复「整机一直重启、有线/无线/SSH 全进不去」：
-#    extdev 原先挂在 mtk_eth_offload_init()（PROBE 阶段，mtk_eth_soc.c:5121），
-#    早于 register_netdev(:5148)、mtk_tx_alloc(:3111, 在 ndo_open 才跑)、
-#    mtk_ppe_start(:3470)。5G 模组在 probe 期间就会来包，于是 learn() 往
-#    未启动的 PPE 写 BIND 表项、GC 每秒读 FOE DMA 内存、inject 访问未分配的
-#    TX ring -> SError/panic -> watchdog 无限复位。
-#    修法：加 hw_ready 门闩。probe 只注册 notifier/hook（纯软件），
-#    只有 PPE 自有 GMAC 收到 NETDEV_UP（即 mtk_open 跑完 start_dma +
-#    ppe_start 之后）才放行 learn / inject / GC，并在此时才启动 GC timer。
-#    tx.c 另外用 netif_running(dev) 做跨翻译单元的第二道保险。
+#  ★ 为什么不改 workflow 也能换源：
+#    workflow step 4 已经 clone 完，step 5 才执行本脚本。
+#    这里用 git remote/fetch/checkout 在【同一个目录 inode】里换内容，
+#    而不是 rm -rf 重建目录 —— 父 shell 后面还要
+#      echo 'src-git qmodem ...' >> feeds.conf.default
+#      ./scripts/feeds update -a / install -a
+#    cwd 必须仍然有效。此做法已用本地 git 仓库模拟验证过。
 #
-#  只改本文件；0.config / workflow / d.txt / f.txt / n.txt 内容均不改动，
-#  所有改动都在编译树内运行时生成（0.config 仅做幂等补齐，见第 4 节）。
+#  ★ 分支名必须是 25.12，不是 openwrt-25.12：
+#    chasey-dev 仓库同时存在这两个分支，只有 25.12 带
+#    MTK OpenWrt Feeds 补丁（README 的 Commit Cutoff 基于它），
+#    openwrt-25.12 是纯净镜像分支。
 #
-#  ★ 部署提示：workflow 里 DIY_SH 当前是 custom/diy_ppe.sh。
-#    二选一才生效：
-#      a) 把本文件覆盖保存为 custom/diy_ppe.sh（推荐，不动 workflow）
-#      b) 把 .github/workflows/*.yml 的 DIY_SH 改成 custom/diy.sh
-#    同时把实现包原样放进 custom/extdev/（第 7 节会装配它）。
-#    确认 CONFIG_FILE 指向的配置里含有本机型 profile；第 4 节只在配置为空
-#    时才补最小基线。
+#  ★ 部署：覆盖 workflow 里 DIY_SH 指向的那个文件即可
+#    （页面显示可能是根目录 diy.sh，也可能是 custom/diy_ppe.sh）。
+#    config 文件（.config / custom/0.config）本脚本一律不碰。
+#    若你已在 workflow 的 env 里改了 REPO_URL / REPO_BRANCH，
+#    脚本会识别 origin 已是 chasey-dev 并自动跳过切源，不会重复操作。
 # ============================================================
 set -e
 
 # ---------------- 可调开关 ----------------
-# wed_enable / ppe_hw_offload 在 25.12 filogic 默认开启，本脚本不提供也不
-# 需要开关。详见文件头「v6 重新确认」。
-USB5G_EXTDEV=1       # 1 = 启用 USB/5G → PPE 回送层（custom/extdev/ 实现包）
-                     # 0 = 急救回退：完全不落 extdev 补丁/源码/kconfig
-EXTDEV_WIRELESS=0    # 0 = extdev 不给 WiFi egress 建 WDMA FOE（保守默认）
-                     #     1 = 允许，仅在已验证不会复位 WiFi 时才开
-                     #     运行时也可改 /sys/module/mtk_eth/parameters/extdev_wireless
-EXTDEV_PREFIX="wwan,usb,eth2"   # QMI/MBIM=wwan0，ECM/RNDIS=usb0/ethX
+TARGET_REPO="https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git"
+TARGET_BRANCH="25.12"
+SWITCH_SOURCE=1          # 0 = 只做后面的自定义，不切源（已改 workflow 时用）
+
+DO_BRAND=1               # 改默认管理 IP / 品牌
+DO_BOARD=1               # 注入 d.txt / f.txt / n.txt 设备片段
+DO_LAN_FALLBACK=1        # 首次开机 LAN / DHCP 兜底
+
 LAN_IP="192.168.6.1"
 BOARD="fzs,5gcpe-p5"
 DEVICE="fzs_5gcpe-p5"
 
 # ---------------- 路径 ----------------
-SRC="$GITHUB_WORKSPACE/custom"
-[ -d "$SRC" ] || SRC="$GITHUB_WORKSPACE"        # 兼容根目录布局（.config / diy.sh）
+TREE="$(pwd)"
+GWS="${GITHUB_WORKSPACE:-$(cd "$TREE/../.." 2>/dev/null && pwd)}"
+SRC="$GWS/custom"
+[ -d "$SRC" ] || SRC="$GWS"        # 兼容根目录布局（.config / diy.sh）
+
 DTS_DIR="target/linux/mediatek/dts"
 DTS="$DTS_DIR/mt7981b-fzs-5gcpe-p5.dts"
 MK="target/linux/mediatek/image/filogic.mk"
 NET="target/linux/mediatek/filogic/base-files/etc/board.d/02_network"
-KCFG="target/linux/mediatek/filogic/config-6.12"
-CFG_CANDIDATES="$SRC/0.config $GITHUB_WORKSPACE/.config $SRC/.config"
-
-echo "[diy] SRC=$SRC  USB5G_EXTDEV=$USB5G_EXTDEV  EXTDEV_WIRELESS=$EXTDEV_WIRELESS"
-echo "[diy] WED / HW offload: 25.12 filogic defaults kept UNTOUCHED"
-
-# ============================================================
-# 1) 品牌 / 管理地址（原逻辑，加存在性保护）
-#    注意：只改默认 IP，不动 LAN 接口与 DHCP 的生成逻辑
-# ============================================================
 CG="package/base-files/files/bin/config_generate"
-if [ -f "$CG" ]; then
-    sed -i "s/192\.168\.1\.1/$LAN_IP/g" "$CG"
-    sed -i 's/ImmortalWrt/FZSWrt/g' "$CG"
-    echo "[diy] config_generate: lan=$LAN_IP, brand=FZSWrt"
-else
-    echo "[diy] WARN: $CG missing, skip" >&2
-fi
 
-if [ -f feeds/luci/collections/luci/Makefile ]; then
-    sed -i 's/luci-theme-argon/luci-theme-bootstrap/g' feeds/luci/collections/luci/Makefile
+echo "[diy] TREE=$TREE  SRC=$SRC"
+echo "[diy] TARGET=$TARGET_REPO @ $TARGET_BRANCH  SWITCH_SOURCE=$SWITCH_SOURCE"
+
+# ============================================================
+# 0) 原地切换源码树
+# ============================================================
+if [ "$SWITCH_SOURCE" = "1" ]; then
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "[diy] ERROR: cwd 不是 git 工作树，无法切源（workflow 的 clone 步骤是否失败？）" >&2
+        exit 1
+    fi
+
+    CUR="$(git remote get-url origin 2>/dev/null || true)"
+    case "$CUR" in
+        *chasey-dev/immortalwrt-mt798x-rebase*)
+            echo "[diy] origin 已是 chasey-dev，跳过切源" ;;
+        *)
+            echo "[diy] 切源: ${CUR:-<no origin>} -> $TARGET_REPO @ $TARGET_BRANCH"
+            if git remote get-url origin >/dev/null 2>&1; then
+                git remote set-url origin "$TARGET_REPO"
+            else
+                git remote add origin "$TARGET_REPO"
+            fi
+            # 保留完整历史（OpenWrt scripts/getver.sh 会用 git log 取版本号）
+            git fetch --no-tags origin "$TARGET_BRANCH"
+            git checkout -f -B "$TARGET_BRANCH" FETCH_HEAD
+            # 清掉旧树残留的 untracked；diy.sh 自身正在执行，必须保留
+            git clean -fdx -e diy.sh -e .config >/dev/null 2>&1 || true
+            echo "[diy] HEAD=$(git log -1 --format='%h %s')"
+            echo "[diy] 切源完成，父 shell 的 cwd=$(pwd) 未被替换"
+            ;;
+    esac
 fi
 
 # ============================================================
-# 2) 设备适配三件套（原逻辑 + 空片段防护）
+# 1) 品牌 / 默认管理地址
+#    chasey-dev 树同样自带 package/base-files/files/bin/config_generate
+# ============================================================
+if [ "$DO_BRAND" = "1" ]; then
+    if [ -f "$CG" ]; then
+        sed -i "s/192\.168\.1\.1/$LAN_IP/g" "$CG"
+        sed -i 's/ImmortalWrt/FZSWrt/g' "$CG"
+        echo "[diy] config_generate: lan=$LAN_IP, brand=FZSWrt"
+    else
+        echo "[diy] WARN: $CG 不存在，跳过品牌修改" >&2
+    fi
+fi
+
+# ============================================================
+# 2) 设备适配三件套（健壮版）
+#    目标文件不存在 / 片段为空 -> 跳过并告警，绝不写空文件、
+#    绝不创建假的 filogic.mk，保证 set -e 下脚本一定跑完。
 #
-#    ★ 这是「刷机后没 IP / 没后台」的主要修复点之一：
-#      原脚本 `lines[0]` 在 d/f/n.txt 为空时抛 IndexError，
-#      配合开头 set -e 会让整个 diy.sh 中途退出，导致
-#      02_network 没写入 -> config_generate 不生成 br-lan ->
-#      dnsmasq 无 DHCP -> 拿不到 IP、进不了后台、也上不了网。
-#      本版：片段为空就跳过并告警，绝不写空 DTS / 空 mk / 空 block，
-#      且 python 注入全程不抛异常，保证脚本一定跑完。
+#    ★ 注意：这三个片段原本是给 immortalwrt 官方树写的。
+#      chasey-dev 树的 image/Makefile、02_network 结构可能不同；
+#      脚本只做「文件存在才追加 / 找到锚点才插入」，找不到就跳过，
+#      不会破坏编译。机型是否已被 chasey-dev 支持请自行核对源码树。
 # ============================================================
 nonempty() { [ -f "$1" ] && [ "$(wc -c < "$1")" -gt 8 ]; }
 
-DTS_OK=0; MK_OK=0; NET_OK=0
-if nonempty "$SRC/d.txt" && nonempty "$SRC/f.txt" && nonempty "$SRC/n.txt"; then
-    DTS_OK=1; MK_OK=1; NET_OK=1
-else
-    echo "[diy] WARN: d.txt/f.txt/n.txt 缺失或为空 -> 跳过板级注入（不写空文件）" >&2
-    echo "[diy]       若这是新机型，请把完整的 DTS/设备定义/02_network 片段放进 custom/" >&2
-    echo "[diy]       本脚本的第 3 节 LAN 兜底仍会保证后台可达" >&2
-fi
+if [ "$DO_BOARD" = "1" ]; then
+    DTS_OK=0; MK_OK=0; NET_OK=0
+    if nonempty "$SRC/d.txt" && nonempty "$SRC/f.txt" && nonempty "$SRC/n.txt"; then
+        DTS_OK=1; MK_OK=1; NET_OK=1
+    else
+        echo "[diy] WARN: d.txt/f.txt/n.txt 缺失或为空 -> 跳过板级注入" >&2
+        echo "[diy]       请把完整的 DTS / 设备定义 / 02_network 片段放到" >&2
+        echo "[diy]       $SRC/ 下；LAN 兜底仍会保证后台可达" >&2
+    fi
 
-if [ "$DTS_OK" = "1" ]; then
-    mkdir -p "$DTS_DIR"
-    cp -f "$SRC/d.txt" "$DTS"
-    echo "[diy] dts -> $DTS"
-elif [ -f "$SRC/d.txt" ] && [ ! -s "$DTS" ]; then
-    :    # 不创建空 DTS：空 DTS 会让 kernel 编译直接失败
-fi
+    if [ "$DTS_OK" = "1" ]; then
+        mkdir -p "$DTS_DIR"
+        cp -f "$SRC/d.txt" "$DTS"
+        echo "[diy] dts -> $DTS"
+    fi
 
-if [ "$MK_OK" = "1" ]; then
-    grep -q "define Device/$DEVICE" "$MK" || cat "$SRC/f.txt" >> "$MK"
-    echo "[diy] filogic.mk: Device/$DEVICE ready"
-fi
+    if [ "$MK_OK" = "1" ]; then
+        if [ -f "$MK" ]; then
+            if ! grep -q "define Device/$DEVICE" "$MK"; then
+                cat "$SRC/f.txt" >> "$MK"
+                echo "[diy] filogic.mk: Device/$DEVICE appended"
+            else
+                echo "[diy] filogic.mk: Device/$DEVICE 已存在"
+            fi
+        else
+            echo "[diy] WARN: $MK 不存在，跳过设备定义注入" >&2
+        fi
+    fi
 
-if [ "$NET_OK" = "1" ]; then
-    python3 - "$SRC/n.txt" "$NET" "$BOARD" <<'PY' || echo "[diy] WARN: 02_network inject skipped" >&2
+    if [ "$NET_OK" = "1" ] && [ -f "$NET" ]; then
+        python3 - "$SRC/n.txt" "$NET" "$BOARD" <<'PY' || echo "[diy] WARN: 02_network 注入跳过" >&2
 import sys
 frag, target, board = sys.argv[1:4]
 try:
     lines = [l.rstrip() for l in open(frag).read().splitlines() if l.strip()]
     if not lines:
-        print("[diy] WARN: empty n.txt, 02_network untouched")
+        print("[diy] WARN: n.txt 为空，02_network 未改动")
         sys.exit(0)
     if not lines[0].startswith("\t"):
         lines[0] = "\t" + lines[0].lstrip()
         lines[1:] = ["\t\t" + l.lstrip() for l in lines[1:]]
     block = "".join(l + "\n" for l in lines)
     s = open(target).read()
-    if board + ")" not in s:
-        start = s.index("mediatek_setup_interfaces()")
-        pos = s.index("\tesac", start)
-        s = s[:pos] + block + s[pos:]
-        open(target, "w").write(s)
-        print("[diy] 02_network: board case injected")
-    else:
-        print("[diy] 02_network: board case already present")
-except Exception as e:
-    print("[diy] WARN: 02_network inject failed (%s), left untouched" % e)
-    sys.exit(0)          # 关键：不把 set -e 触发成整体失败
+    if board + ")" in s:
+        print("[diy] 02_network: board case 已存在")
+        sys.exit(0)
+    start = s.index("mediatek_setup_interfaces()")
+    pos = s.index("\tesac", start)
+    open(target, "w").write(s[:pos] + block + s[pos:])
+    print("[diy] 02_network: board case injected")
+except (ValueError, OSError) as e:
+    print("[diy] WARN: 02_network 锚点未找到，未改动 (%s)" % e)
 PY
-    if [ -f "$NET" ]; then chmod +x "$NET"; fi
+    elif [ "$NET_OK" = "1" ]; then
+        echo "[diy] WARN: $NET 不存在，跳过 02_network 注入" >&2
+    fi
+    echo "[diy] board injection done (dts=$DTS_OK mk=$MK_OK net=$NET_OK)"
 fi
-echo "[diy] board injection done (dts=$DTS_OK mk=$MK_OK net=$NET_OK)"
 
 # ============================================================
-# 3) ★ 修复「刷机后无内网 IP / 进不了后台」的根部兜底
-#
-#    OpenWrt 首次开机由 config_generate 依据 /etc/board.json 生成
-#    /etc/config/network 与 /etc/config/dhcp。只要 02_network 没匹配到
-#    板子（或上一步被中断），br-lan / lan / dhcp.lan 全部不会生成：
-#      -> 电脑拿不到地址、192.168.6.1 打不开、dnsmasq 没起、NAT 也没了。
-#    这里放一个只在「缺失时」生效的 uci-defaults：补 br-lan + lan +
-#    dhcp.lan，且绝不覆盖已有配置。uci-defaults 执行后会自动删除，
-#    不会在后续开机反复改用户配置；也不 restart 任何服务。
+# 3) LAN / DHCP 首次开机兜底（只在配置缺失时补，绝不覆盖已有配置，
+#    不重启任何服务；uci-defaults 执行完会自动删除）
 # ============================================================
-mkdir -p files/etc/uci-defaults
-cat > files/etc/uci-defaults/97-lan-fallback <<EOF
+if [ "$DO_LAN_FALLBACK" = "1" ]; then
+    mkdir -p files/etc/uci-defaults files/usr/sbin
+    cat > files/etc/uci-defaults/97-lan-fallback <<EOF
 #!/bin/sh
-# 首次开机兜底：仅在 lan / dhcp.lan 缺失时补最小可用局域网配置。
-# 已有配置一律不动；不重启服务（boot 阶段 network 尚未 start）。
 LAN_IP='$LAN_IP'
-
 if ! uci -q get network.lan >/dev/null 2>&1; then
-    # 1) 建 br-lan，纳入实际存在的物理口（DSA 与独立网口都兼容）
     uci -q set network.br_lan=device
     uci -q set network.br_lan.name='br-lan'
     uci -q set network.br_lan.type='bridge'
-    for p in lan1 lan2 lan3 lan4 lan eth0 eth1 eth2; do
+    for p in lan1 lan2 lan3 lan4 lan eth0 eth1 eth2 rxppd; do
         if [ -d "/sys/class/net/\$p" ]; then
             uci -q add_list network.br_lan.ports="\$p"
         fi
     done
-
-    # 2) lan 静态地址（后台管理页）
     uci -q set network.lan=interface
     uci -q set network.lan.device='br-lan'
     uci -q set network.lan.proto='static'
@@ -193,8 +210,6 @@ if ! uci -q get network.lan >/dev/null 2>&1; then
     uci -q commit network
     echo "[lan-fallback] network.lan created at \$LAN_IP"
 fi
-
-# 3) DHCP 服务器：没有 dhcp.lan 就补上，否则 dnsmasq 不发地址
 if ! uci -q get dhcp.lan >/dev/null 2>&1; then
     uci -q set dhcp.lan=dhcp
     uci -q set dhcp.lan.interface='lan'
@@ -204,253 +219,60 @@ if ! uci -q get dhcp.lan >/dev/null 2>&1; then
     uci -q commit dhcp
     echo "[lan-fallback] dhcp.lan created"
 fi
-
 exit 0
 EOF
-chmod +x files/etc/uci-defaults/97-lan-fallback
-echo "[diy] LAN/DHCP fallback installed (only fills missing config)"
+    chmod +x files/etc/uci-defaults/97-lan-fallback
+    echo "[diy] LAN/DHCP fallback installed"
+fi
 
 # ============================================================
-# 4) 编译配置幂等补齐
-#    workflow 在 diy.sh 之后才执行 `mv 0.config .config && make defconfig`，
-#    所以这里改 0.config 是生效的；不直接写 .config（会被覆盖）。
-#    不认识的 CONFIG 会被 make defconfig 自动丢弃，不会伤配置。
+# 4) 只读验证脚本（不写任何配置，纯观察）
 # ============================================================
-for C in $CFG_CANDIDATES; do
-    [ -f "$C" ] || continue
-    python3 - "$C" "$DEVICE" <<'PYCFG' || echo "[diy] WARN: config patch skipped for $C" >&2
-import sys, os, re
-path, device = sys.argv[1], sys.argv[2]
-s = open(path, encoding='utf-8', errors='ignore').read()
-
-# 配置为空/近乎为空时，补一套最小可编译的 MT7981 filogic 基线
-if len([l for l in s.splitlines() if l.strip()]) < 2:
-    base = [
-        'CONFIG_TARGET_mediatek=y',
-        'CONFIG_TARGET_mediatek_filogic=y',
-        'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_%s=y' % device,
-        'CONFIG_PACKAGE_dnsmasq=y',
-        'CONFIG_PACKAGE_firewall4=y',
-        'CONFIG_PACKAGE_kmod-mt7915e=y',
-        'CONFIG_PACKAGE_kmod-usb-serial-option=y',
-        'CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y',
-        'CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y',
-        'CONFIG_PACKAGE_kmod-usb-net-rndis=y',
-        'CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y',
-        'CONFIG_PACKAGE_bridger=y',
-    ]
-    s = '\n'.join(base) + '\n'
-    print('[diy] %s was empty -> minimal filogic baseline written' % path)
-else:
-    def force(sym):
-        global s
-        p = re.compile(r'(?m)^#\s*' + re.escape(sym) + r' is not set\s*$')
-        if p.search(s):
-            s = p.sub(sym + '=y', s)
-        elif not re.search(r'(?m)^' + re.escape(sym) + r'=y\s*$', s):
-            s = s.rstrip('\n') + '\n' + sym + '=y\n'
-    # 只补 PPE/WED 相关包，不动用户已有的 target/profile/插件选择
-    for sym in ('CONFIG_PACKAGE_kmod-mt7915e',
-                'CONFIG_PACKAGE_bridger',
-                'CONFIG_PACKAGE_dnsmasq',
-                'CONFIG_PACKAGE_firewall4'):
-        force(sym)
-    print('[diy] %s: PPE packages ensured (rest untouched)' % path)
-
-open(path, 'w', encoding='utf-8').write(s)
-PYCFG
-done
-
-# ============================================================
-# 5) 内核配置 / rootfs：不碰 WED 与 HW offload 的默认
-#
-#    ★ v6 起本节故意留空。核对结论（见文件头）：
-#      - CONFIG_NET_MEDIATEK_SOC_WED=y  filogic/config-6.12:327 本来就是
-#      - wed_enable=Y                   mt76 Makefile:242 MODPARAMS 包自带
-#      - CONFIG_NF_FLOW_TABLE_HW_OFFLOAD / NF_CONNTRACK_EVENTS
-#                                        firewall4 依赖 +kmod-nft-offload，
-#                                        由 package-metadata.pl 的
-#                                        .config.override 在构建期打开
-#      - flow_offloading=1              firewall.config 默认
-#    写这些只会制造冗余甚至冲突（v5 的 rm -f 还误以为能关掉 WED）。
-#    唯一需要写的内核符号是 extdev 新增的 CONFIG_NET_MEDIATEK_PPE_EXTDEV，
-#    由第 7 节负责；它 depends on NET_MEDIATEK_SOC_WED（默认已开）与
-#    NF_CONNTRACK，不再依赖默认关闭的 NF_CONNTRACK_EVENTS。
-# ============================================================
-mkdir -p files/etc/uci-defaults files/usr/sbin
-echo "[diy] WED / HW offload defaults: untouched (no modules.d, no uci write)"
-
-# 6) 验证脚本（只读探测，不改任何默认）
-cat > files/usr/sbin/verify-ppe.sh <<'EOF'
+mkdir -p files/usr/sbin
+cat > files/usr/sbin/verify-hnat.sh <<'EOF'
 #!/bin/sh
-# 打流时运行：确认 PPE 真的在干活，而不是只有吞吐变高
 say() { printf '\n=== %s ===\n' "$*"; }
 
-say "1. LAN / 后台（先确认能进管理页）"
-ip -4 addr show br-lan 2>/dev/null || ip -4 addr show lan 2>/dev/null || echo "  !! br-lan 不存在"
-uci -q get network.lan.ipaddr
-uci -q get dhcp.lan.interface
-ps | grep -q '[d]nsmasq' && echo "  dnsmasq: running" || echo "  !! dnsmasq: NOT running"
+say "1. LAN / 后台"
+ip -4 addr show br-lan 2>/dev/null || echo "  !! br-lan 不存在"
+printf '  lan ipaddr = '; uci -q get network.lan.ipaddr
+ps | grep -q '[d]nsmasq' && echo "  dnsmasq: running" || echo "  !! dnsmasq NOT running"
 
-say "2. WED / HW offload 默认值（只读，应为 Y / 1 / 1）"
-for m in mt7915e mt7996e; do
-    f="/sys/module/$m/parameters/wed_enable"
-    [ -r "$f" ] && { printf '  %-10s wed_enable = ' "$m"; cat "$f"; }
+say "2. 版本"
+cat /etc/openwrt_release 2>/dev/null
+
+say "3. HNAT 角色 / 开关（只读）"
+for f in /sys/kernel/debug/hnat/hnat_lan_if \
+         /sys/kernel/debug/hnat/hnat_wan_if \
+         /sys/kernel/debug/hnat/hook_toggle \
+         /sys/kernel/debug/hnat/external_interface; do
+    [ -r "$f" ] && { printf '  %-24s = ' "$(basename "$f")"; cat "$f"; }
 done
-printf '  flow_offloading    = '; uci -q get firewall.@defaults[0].flow_offloading
-printf '  flow_offloading_hw = '; uci -q get firewall.@defaults[0].flow_offloading_hw
-echo "  （这两项由 25.12 默认开启，diy 脚本不覆盖）"
 
-say "4. PPE 已绑定流（决定性判据）"
-for p in /sys/kernel/debug/ppe0/bind /sys/kernel/debug/ppe1/bind \
-         /sys/kernel/debug/mtk_ppe/bind; do
-    [ -r "$p" ] || continue
-    printf '  -- %s --\n' "$p"
-    grep -E 'BND' "$p" | head -20
+say "4. PPE 已绑定流（打流时应增长）"
+for p in /sys/kernel/debug/ppe0/bind /sys/kernel/debug/ppe1/bind; do
+    [ -r "$p" ] && { printf '  %-28s BIND=%s\n' "$p" "$(grep -c BIND "$p")"; }
 done
-echo "  看 orig=/new= 里是否出现你的 LAN / WiFi 客户端 IP 或 MAC"
 
-say "5. 硬件计数（打流时须增长）"
-tc -s filter show dev eth0 ingress 2>/dev/null | grep -E 'in_hw|Sent hardware' | head -5
-sleep 5
-tc -s filter show dev eth0 ingress 2>/dev/null | grep -E 'Sent hardware' | head -5
-
-say "6. CPU"
+say "5. CPU / 日志"
 cat /proc/loadavg
-echo "  有效 offload 时 ksoftirqd 应明显低于纯软件转发"
-
-say "7. A/B"
-echo "  关掉 flow_offloading_hw 再测：BND 流应消失、CPU 应上升。"
-echo "  吞吐变高不等于 PPE 生效，软件 flowtable 也能提吞吐。"
+dmesg | grep -iE 'hnat|mt7915|wed|ppe|extif' | tail -15
 EOF
-chmod +x files/usr/sbin/verify-ppe.sh
+chmod +x files/usr/sbin/verify-hnat.sh
 
 # ============================================================
-# 7) USB/5G 模组 → 有线/无线 PPE 加速：6.12 主线回送层（完整实现）
-#
-#    custom/extdev/ 里是实现包：
-#      1001-mtk-ppe-extdev.patch   由 gen_patch.py 对真实 6.12 源码生成
-#      gen_patch.py                内核小版本升级时重新生成补丁
-#      mtk_ppe_extdev.c/.h         学流 / rx_handler / FOE 建表 / 老化
-#      mtk_ppe_extdev_tx.c         QDMA TX 注入，fport = PSE_PPE0_PORT
-#
-#    机制：QDMA TX 描述符把未经 NAT 的原始 skb 送进 PPE 查表引擎；
-#    HNAPT FOE 表项由主线 mtk_flow_set_output_device() 编码 DSA/GDM，
-#    并由新增的 mtk_foe_entry_bind_hw() 主动写进硬件槽位
-#    （6.12 的 mtk_foe_entry_commit() 只挂软件链表、留 UNBIND）。
-#    ★ v6 启动门闩：probe 阶段只注册 notifier/hook（纯软件），
-#      只有 PPE 自有 GMAC 的 NETDEV_UP（mtk_open 跑完 start_dma +
-#      ppe_start）才放行 learn / inject / GC，修掉整机 watchdog 复位循环。
-#    ★ EXTDEV_WIRELESS=0 是保守默认：WED 在 25.12 默认开启，但 extdev
-#      的 bind_hw() 走 WDMA 路径尚未实机验证，先让 USB→WiFi 走软件
-#      flowtable；运行时可 echo 1 > .../extdev_wireless 逐级验证。
-#    上行 → USB 模组仍走 CPU：FOE 没有 USB 出口。
-# ============================================================
-EXT_SRC="$SRC/extdev"
-PDIR="target/linux/mediatek/patches-6.12"
-FDIR="target/linux/mediatek/files-6.12/drivers/net/ethernet/mediatek"
-
-if [ "$USB5G_EXTDEV" = "1" ]; then
-    MISSING=0
-    for f in 1001-mtk-ppe-extdev.patch mtk_ppe_extdev.c \
-             mtk_ppe_extdev.h mtk_ppe_extdev_tx.c; do
-        [ -s "$EXT_SRC/$f" ] || { echo "[diy] extdev: missing $f" >&2; MISSING=1; }
-    done
-
-    if [ "$MISSING" = "0" ] && [ -f "$KCFG" ]; then
-        mkdir -p "$PDIR" "$FDIR" files/etc/uci-defaults
-        cp -f "$EXT_SRC/1001-mtk-ppe-extdev.patch" "$PDIR/"
-        cp -f "$EXT_SRC/mtk_ppe_extdev.c" "$EXT_SRC/mtk_ppe_extdev.h" \
-              "$EXT_SRC/mtk_ppe_extdev_tx.c" "$FDIR/"
-        # gen_patch.py 是开发工具，不进编译树（留在 custom/extdev/ 即可）
-
-        # 写 extdev 自身需要的两个内核符号（与 WED / HW offload 无关）：
-        #   CONFIG_NET_MEDIATEK_PPE_EXTDEV=y  新增功能开关
-        #   CONFIG_NF_CONNTRACK=y             extdev.c 用 nf_ct_get()，
-        #     在 generic/config-6.12 里是 "is not set"；包层通常会打开，
-        #     但 built-in 代码引用它必须显式为 y，否则链接期 undefined。
-        # Kconfig 只 depends on NET_MEDIATEK_SOC / NET_MEDIATEK_SOC_WED
-        # （filogic/config-6.12:326/327 默认都是 y），避免 oldconfig 把
-        # PPE_EXTDEV 静默丢掉。WED、flow_offloading_hw 一律不写。
-        python3 - "$KCFG" <<'PYEXT' || echo "[diy] WARN: extdev kconfig skipped" >&2
-import sys, re
-p = sys.argv[1]
-s = open(p).read()
-def on(sym):
-    global s
-    pat = re.compile(r'(?m)^#?\s*' + re.escape(sym) + r'(?:=.*| is not set)\s*$')
-    line = sym + '=y'
-    if pat.search(s):
-        s = pat.sub(line, s)
-    else:
-        s = s.rstrip('\n') + '\n' + line + '\n'
-for x in ('CONFIG_NF_CONNTRACK', 'CONFIG_NET_MEDIATEK_PPE_EXTDEV'):
-    on(x)
-open(p, 'w').write(s)
-print('[diy] extdev: NF_CONNTRACK + PPE_EXTDEV written; WED/HW offload untouched')
-PYEXT
-
-        # built-in 模块参数：modules.d 对 built-in 无效，用 uci-defaults 写 sysfs
-        cat > files/etc/uci-defaults/96-mtk-ppe-extdev <<'EOF'
-#!/bin/sh
-# mtk_eth 是 built-in，参数在 /sys/module/mtk_eth/parameters/
-# 运行时一键回退：echo 0 > /sys/module/mtk_eth/parameters/extdev_enable
-P=/sys/module/mtk_eth/parameters/extdev_prefix
-[ -w "$P" ] && echo '__PREFIX__' > "$P"
-# 无线 egress 保守默认关闭：WED 默认开启，WDMA FOE 路径尚未实机验证
-W=/sys/module/mtk_eth/parameters/extdev_wireless
-[ -w "$W" ] && echo '__WIRELESS__' > "$W"
-exit 0
-EOF
-        sed -i "s|__PREFIX__|$EXTDEV_PREFIX|g; s|__WIRELESS__|$EXTDEV_WIRELESS|g" files/etc/uci-defaults/96-mtk-ppe-extdev
-        chmod +x files/etc/uci-defaults/96-mtk-ppe-extdev
-
-        # 把 extdev 判据追加到验证脚本
-        cat >> files/usr/sbin/verify-ppe.sh <<'EOF'
-
-say "8. extdev（USB/5G → PPE 回送层）"
-echo "  sysfs: /sys/module/mtk_eth/parameters/extdev_{prefix,enable,wireless}"
-for p in prefix enable wireless; do
-    f="/sys/module/mtk_eth/parameters/extdev_$p"
-    [ -r "$f" ] && { printf '  extdev_%-9s = ' "$p"; cat "$f"; }
-done
-for f in /sys/kernel/debug/mtk_ppe_extdev/*; do
-    [ -r "$f" ] && { printf '  %-16s = ' "$(basename "$f")"; cat "$f"; }
-done
-echo "  ★ hw_ready 必须为 1：0 = 启动门闩未开（GMAC 没 UP），此时不注入属正常"
-echo "  ★ 整机复位 / 异常时先：echo 0 > /sys/module/mtk_eth/parameters/extdev_enable"
-echo "  有线 egress 才有 PPE：wireless_skip 增长属正常（WiFi 走软件路径）"
-echo "  rx_inject 涨 + stale_out=0 + hw_ready=1 + ppe0/bind 有 BND 流 = 硬件真在转发"
-dmesg | grep -i -E 'extdev|mt7915|wed' | tail -15
-EOF
-
-        echo "[diy] extdev: ENABLED (patch + 3 sources + kconfig + rootfs)"
-        echo "[diy] extdev: fport=PSE_PPE0_PORT, bind_hw=on, stale self-heal=on"
-        echo "[diy] extdev: hw_ready gate=ON (probe->NETDEV_UP), GC armed on UP"
-        if [ "$EXTDEV_WIRELESS" = "1" ]; then
-            echo "[diy] extdev: wireless egress=ALLOWED (experimental)"
-        else
-            echo "[diy] extdev: wireless egress=REFUSED (WiFi-safe default)"
-        fi
-    else
-        echo "[diy] extdev: 实现包不全或 $KCFG 缺失 -> 自动回退为 0（不破坏编译）" >&2
-        USB5G_EXTDEV=0
-    fi
-fi
-
-# ============================================================
-# 8) 收尾自检
+# 5) 收尾自检
 # ============================================================
 echo "[diy] --- summary ---"
-echo "[diy] no SONiC fullcone / no NAT patch / no package removal / no service restart"
-echo "[diy] LAN fallback   : files/etc/uci-defaults/97-lan-fallback"
-echo "[diy] WED / HW offld : 25.12 defaults kept (NOT written by this script)"
-echo "[diy] verify script  : files/usr/sbin/verify-ppe.sh"
-echo "[diy] USB5G extdev   : $USB5G_EXTDEV (1 = PSE_PPE0_PORT 注入 + bind_hw)"
-if [ "$EXTDEV_WIRELESS" = "1" ]; then
-    echo "[diy] extdev WiFi    : 1 (WDMA FOE allowed, experimental)"
+echo "[diy] source tree   : $(git log -1 --format='%h %s' 2>/dev/null || echo '<not a git tree>')"
+echo "[diy] origin        : $(git remote get-url origin 2>/dev/null || echo '<none>')"
+echo "[diy] kernel config : NOT touched"
+echo "[diy] modules.d     : NOT touched"
+echo "[diy] firewall cfg  : NOT touched (按要求忽略)"
+if [ "$DO_LAN_FALLBACK" = "1" ]; then
+    echo "[diy] LAN fallback  : files/etc/uci-defaults/97-lan-fallback"
 else
-    echo "[diy] extdev WiFi    : 0 (WiFi on software path, no WDMA FOE)"
+    echo "[diy] LAN fallback  : disabled"
 fi
-echo "[diy] extdev pkg     : $([ "$USB5G_EXTDEV" = 1 ] && echo custom/extdev/ || echo not used)"
+echo "[diy] verify script : files/usr/sbin/verify-hnat.sh"
 echo "[diy] done"
