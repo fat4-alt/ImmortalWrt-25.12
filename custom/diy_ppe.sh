@@ -5,9 +5,33 @@
 #  基于原 custom/diy.sh 重写：
 #    x 不含 SONiC fullcone（不打 984~987 内核补丁、不删 firewall4 依赖、
 #      不替换 NAT 栈、不默认全开 fullcone、不 restart firewall）
-#    + 加入主线 PPE 硬件加速（WED 无线 + HW flow offload 有线）
+#    + 加入 USB/5G 模组 → 有线/无线 PPE 硬件加速（custom/extdev/ 实现包）
 #    + 修复「刷机后拿不到内网 IP / 进不了后台 / 无法联网」
 #    + 脚本自包含健壮性：空片段不崩、不写空 DTS、不破坏板级网络配置
+#
+#  ★ v6 重新确认（重要，改掉前几版的错误认知）：
+#    wed_enable 与 ppe_hw_offload 在 ImmortalWrt 25.12 filogic 上本来就是
+#    **默认开启**的，本脚本一律不碰：
+#      - package/kernel/mt76/Makefile:242 对 mediatek_filogic 无条件设置
+#        MODPARAMS.mt7915e:=wed_enable=Y（包自带，删 files/ 下的文件关不掉）
+#      - filogic/config-6.12:327 本来就是 CONFIG_NET_MEDIATEK_SOC_WED=y
+#      - firewall.config 默认 option flow_offloading 1；firewall4 硬依赖
+#        +kmod-nft-offload，CONFIG_NF_FLOW_TABLE_HW_OFFLOAD 由包层 override
+#        打开，不是 kernel config 片段
+#    所以：不写 modules.d/50-mtk-ppe-wed、不写 flow_offloading* uci-defaults、
+#    不改这三个内核符号。只写 extdev 自己新增的 CONFIG_NET_MEDIATEK_PPE_EXTDEV。
+#    （v5 里 "rm 50-mtk-ppe-wed 关闭 WED" 是无效操作，WED 一直开着。）
+#
+#  ★ v6 修复「整机一直重启、有线/无线/SSH 全进不去」：
+#    extdev 原先挂在 mtk_eth_offload_init()（PROBE 阶段，mtk_eth_soc.c:5121），
+#    早于 register_netdev(:5148)、mtk_tx_alloc(:3111, 在 ndo_open 才跑)、
+#    mtk_ppe_start(:3470)。5G 模组在 probe 期间就会来包，于是 learn() 往
+#    未启动的 PPE 写 BIND 表项、GC 每秒读 FOE DMA 内存、inject 访问未分配的
+#    TX ring -> SError/panic -> watchdog 无限复位。
+#    修法：加 hw_ready 门闩。probe 只注册 notifier/hook（纯软件），
+#    只有 PPE 自有 GMAC 收到 NETDEV_UP（即 mtk_open 跑完 start_dma +
+#    ppe_start 之后）才放行 learn / inject / GC，并在此时才启动 GC timer。
+#    tx.c 另外用 netif_running(dev) 做跨翻译单元的第二道保险。
 #
 #  只改本文件；0.config / workflow / d.txt / f.txt / n.txt 内容均不改动，
 #  所有改动都在编译树内运行时生成（0.config 仅做幂等补齐，见第 4 节）。
@@ -23,10 +47,13 @@
 set -e
 
 # ---------------- 可调开关 ----------------
-PPE_WED=1            # 1 = 打开 WED（无线侧 PPE / WDMA）
-PPE_HW_OFFLOAD=1     # 1 = 打开主线硬件 flow offload（有线侧 PPE）
-USB5G_EXTDEV=1       # 1 = 启用已按 6.12 收包路径写完的 USB/5G → PPE 回送层
-                     #     （custom/extdev/ 实现包）；0 = 只留主线原生加速
+# wed_enable / ppe_hw_offload 在 25.12 filogic 默认开启，本脚本不提供也不
+# 需要开关。详见文件头「v6 重新确认」。
+USB5G_EXTDEV=1       # 1 = 启用 USB/5G → PPE 回送层（custom/extdev/ 实现包）
+                     # 0 = 急救回退：完全不落 extdev 补丁/源码/kconfig
+EXTDEV_WIRELESS=0    # 0 = extdev 不给 WiFi egress 建 WDMA FOE（保守默认）
+                     #     1 = 允许，仅在已验证不会复位 WiFi 时才开
+                     #     运行时也可改 /sys/module/mtk_eth/parameters/extdev_wireless
 EXTDEV_PREFIX="wwan,usb,eth2"   # QMI/MBIM=wwan0，ECM/RNDIS=usb0/ethX
 LAN_IP="192.168.6.1"
 BOARD="fzs,5gcpe-p5"
@@ -42,7 +69,8 @@ NET="target/linux/mediatek/filogic/base-files/etc/board.d/02_network"
 KCFG="target/linux/mediatek/filogic/config-6.12"
 CFG_CANDIDATES="$SRC/0.config $GITHUB_WORKSPACE/.config $SRC/.config"
 
-echo "[diy] SRC=$SRC  PPE_WED=$PPE_WED  PPE_HW_OFFLOAD=$PPE_HW_OFFLOAD"
+echo "[diy] SRC=$SRC  USB5G_EXTDEV=$USB5G_EXTDEV  EXTDEV_WIRELESS=$EXTDEV_WIRELESS"
+echo "[diy] WED / HW offload: 25.12 filogic defaults kept UNTOUCHED"
 
 # ============================================================
 # 1) 品牌 / 管理地址（原逻辑，加存在性保护）
@@ -234,74 +262,25 @@ PYCFG
 done
 
 # ============================================================
-# 5) 主线 PPE 硬件加速：内核侧
-#    写 target/linux/mediatek/filogic/config-6.12（内核 config 片段），
-#    不写 .config；make defconfig 会合并，且不受 0.config 覆盖影响。
-#      NET_MEDIATEK_SOC_WED     -> WED / WDMA，PPE 直连无线
-#      NF_FLOW_TABLE_HW_OFFLOAD -> 有线侧 flowtable 下发到 PPE
-#      NF_CONNTRACK_EVENTS      -> 流老化同步（PPE 表项回收）
-#    这三样都是 25.12 / 6.12 原生能力，不改驱动、不打内核补丁。
+# 5) 内核配置 / rootfs：不碰 WED 与 HW offload 的默认
+#
+#    ★ v6 起本节故意留空。核对结论（见文件头）：
+#      - CONFIG_NET_MEDIATEK_SOC_WED=y  filogic/config-6.12:327 本来就是
+#      - wed_enable=Y                   mt76 Makefile:242 MODPARAMS 包自带
+#      - CONFIG_NF_FLOW_TABLE_HW_OFFLOAD / NF_CONNTRACK_EVENTS
+#                                        firewall4 依赖 +kmod-nft-offload，
+#                                        由 package-metadata.pl 的
+#                                        .config.override 在构建期打开
+#      - flow_offloading=1              firewall.config 默认
+#    写这些只会制造冗余甚至冲突（v5 的 rm -f 还误以为能关掉 WED）。
+#    唯一需要写的内核符号是 extdev 新增的 CONFIG_NET_MEDIATEK_PPE_EXTDEV，
+#    由第 7 节负责；它 depends on NET_MEDIATEK_SOC_WED（默认已开）与
+#    NF_CONNTRACK，不再依赖默认关闭的 NF_CONNTRACK_EVENTS。
 # ============================================================
-if [ -f "$KCFG" ]; then
-    python3 - "$KCFG" "$PPE_WED" "$PPE_HW_OFFLOAD" <<'PYK' || echo "[diy] WARN: kernel config tweak skipped" >&2
-import sys, re
-path, wed, hw = sys.argv[1], sys.argv[2] == '1', sys.argv[3] == '1'
-s = open(path).read()
+mkdir -p files/etc/uci-defaults files/usr/sbin
+echo "[diy] WED / HW offload defaults: untouched (no modules.d, no uci write)"
 
-def set_sym(sym, on):
-    global s
-    p = re.compile(r'(?m)^#?\s*' + re.escape(sym) + r'(?:=.*| is not set)\s*$')
-    line = (sym + '=y') if on else ('# ' + sym + ' is not set')
-    if p.search(s):
-        s = p.sub(line, s)
-    else:
-        s = s.rstrip('\n') + '\n' + line + '\n'
-
-set_sym('CONFIG_NET_MEDIATEK_SOC_WED', wed)
-set_sym('CONFIG_NF_FLOW_TABLE_HW_OFFLOAD', hw)
-set_sym('CONFIG_NF_CONNTRACK_EVENTS', hw)
-open(path, 'w').write(s)
-print('[diy] %s: WED=%s HW_OFFLOAD=%s' % (path, wed, hw))
-PYK
-else
-    echo "[diy] WARN: $KCFG not found (kernel PPE config skipped)" >&2
-fi
-
-# ============================================================
-# 6) 主线 PPE 硬件加速：rootfs 侧
-# ============================================================
-mkdir -p files/etc/modules.d files/etc/uci-defaults files/usr/sbin
-
-# 6a) WED 模块参数（OpenWrt 24.10+ 写法；sysupgrade 后需重新放）
-if [ "$PPE_WED" = "1" ]; then
-    cat > files/etc/modules.d/50-mtk-ppe-wed <<'EOF'
-# WED: 让 PPE 直接处理来往 WiFi chipset 的包（仅 5G/6G radio）
-# MT7996 / MT7987 请换成: mt7996e wed_enable=Y
-# 此文件不在默认 sysupgrade 备份列表里，升级后需重新添加。
-mt7915e wed_enable=Y
-EOF
-fi
-
-# 6b) firewall4 的两个标准开关。只 uci commit，绝不 restart firewall
-#     （上一版 sonic 的 restart + NAT 补丁替换正是「无法联网」的放大项）
-cat > files/etc/uci-defaults/98-mtk-ppe-offload <<EOF
-#!/bin/sh
-# 主线 PPE 硬件加速默认开；首次开机执行一次后自动删除
-if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
-    uci -q set firewall.@defaults[0].flow_offloading='1'
-    if [ '$PPE_HW_OFFLOAD' = '1' ]; then
-        uci -q set firewall.@defaults[0].flow_offloading_hw='1'
-    else
-        uci -q delete firewall.@defaults[0].flow_offloading_hw 2>/dev/null || true
-    fi
-    uci -q commit firewall
-fi
-# 不碰 fullcone、不碰 NAT 规则、不重启任何服务
-exit 0
-EOF
-chmod +x files/etc/uci-defaults/98-mtk-ppe-offload
-
-# 6c) 验证脚本
+# 6) 验证脚本（只读探测，不改任何默认）
 cat > files/usr/sbin/verify-ppe.sh <<'EOF'
 #!/bin/sh
 # 打流时运行：确认 PPE 真的在干活，而不是只有吞吐变高
@@ -313,15 +292,14 @@ uci -q get network.lan.ipaddr
 uci -q get dhcp.lan.interface
 ps | grep -q '[d]nsmasq' && echo "  dnsmasq: running" || echo "  !! dnsmasq: NOT running"
 
-say "2. WED 参数"
+say "2. WED / HW offload 默认值（只读，应为 Y / 1 / 1）"
 for m in mt7915e mt7996e; do
     f="/sys/module/$m/parameters/wed_enable"
-    [ -r "$f" ] && { printf '  %s = ' "$m"; cat "$f"; }
+    [ -r "$f" ] && { printf '  %-10s wed_enable = ' "$m"; cat "$f"; }
 done
-
-say "3. 硬件 flow offload 开关"
-uci -q get firewall.@defaults[0].flow_offloading
-uci -q get firewall.@defaults[0].flow_offloading_hw
+printf '  flow_offloading    = '; uci -q get firewall.@defaults[0].flow_offloading
+printf '  flow_offloading_hw = '; uci -q get firewall.@defaults[0].flow_offloading_hw
+echo "  （这两项由 25.12 默认开启，diy 脚本不覆盖）"
 
 say "4. PPE 已绑定流（决定性判据）"
 for p in /sys/kernel/debug/ppe0/bind /sys/kernel/debug/ppe1/bind \
@@ -357,9 +335,15 @@ chmod +x files/usr/sbin/verify-ppe.sh
 #      mtk_ppe_extdev_tx.c         QDMA TX 注入，fport = PSE_PPE0_PORT
 #
 #    机制：QDMA TX 描述符把未经 NAT 的原始 skb 送进 PPE 查表引擎；
-#    HNAPT FOE 表项由主线 mtk_flow_set_output_device() 编码 DSA/GDM/WDMA，
+#    HNAPT FOE 表项由主线 mtk_flow_set_output_device() 编码 DSA/GDM，
 #    并由新增的 mtk_foe_entry_bind_hw() 主动写进硬件槽位
 #    （6.12 的 mtk_foe_entry_commit() 只挂软件链表、留 UNBIND）。
+#    ★ v6 启动门闩：probe 阶段只注册 notifier/hook（纯软件），
+#      只有 PPE 自有 GMAC 的 NETDEV_UP（mtk_open 跑完 start_dma +
+#      ppe_start）才放行 learn / inject / GC，修掉整机 watchdog 复位循环。
+#    ★ EXTDEV_WIRELESS=0 是保守默认：WED 在 25.12 默认开启，但 extdev
+#      的 bind_hw() 走 WDMA 路径尚未实机验证，先让 USB→WiFi 走软件
+#      flowtable；运行时可 echo 1 > .../extdev_wireless 逐级验证。
 #    上行 → USB 模组仍走 CPU：FOE 没有 USB 出口。
 # ============================================================
 EXT_SRC="$SRC/extdev"
@@ -380,9 +364,14 @@ if [ "$USB5G_EXTDEV" = "1" ]; then
               "$EXT_SRC/mtk_ppe_extdev_tx.c" "$FDIR/"
         # gen_patch.py 是开发工具，不进编译树（留在 custom/extdev/ 即可）
 
-        # Kconfig: NET_MEDIATEK_PPE_EXTDEV depends on
-        # NET_MEDIATEK_SOC && NET_MEDIATEK_SOC_WED &&
-        # NF_CONNTRACK && NF_CONNTRACK_EVENTS
+        # 写 extdev 自身需要的两个内核符号（与 WED / HW offload 无关）：
+        #   CONFIG_NET_MEDIATEK_PPE_EXTDEV=y  新增功能开关
+        #   CONFIG_NF_CONNTRACK=y             extdev.c 用 nf_ct_get()，
+        #     在 generic/config-6.12 里是 "is not set"；包层通常会打开，
+        #     但 built-in 代码引用它必须显式为 y，否则链接期 undefined。
+        # Kconfig 只 depends on NET_MEDIATEK_SOC / NET_MEDIATEK_SOC_WED
+        # （filogic/config-6.12:326/327 默认都是 y），避免 oldconfig 把
+        # PPE_EXTDEV 静默丢掉。WED、flow_offloading_hw 一律不写。
         python3 - "$KCFG" <<'PYEXT' || echo "[diy] WARN: extdev kconfig skipped" >&2
 import sys, re
 p = sys.argv[1]
@@ -390,16 +379,15 @@ s = open(p).read()
 def on(sym):
     global s
     pat = re.compile(r'(?m)^#?\s*' + re.escape(sym) + r'(?:=.*| is not set)\s*$')
+    line = sym + '=y'
     if pat.search(s):
-        s = pat.sub(sym + '=y', s)
+        s = pat.sub(line, s)
     else:
-        s = s.rstrip('\n') + '\n' + sym + '=y\n'
-for x in ('CONFIG_NET_MEDIATEK_SOC', 'CONFIG_NET_MEDIATEK_SOC_WED',
-          'CONFIG_NF_CONNTRACK', 'CONFIG_NF_CONNTRACK_EVENTS',
-          'CONFIG_NET_MEDIATEK_PPE_EXTDEV'):
+        s = s.rstrip('\n') + '\n' + line + '\n'
+for x in ('CONFIG_NF_CONNTRACK', 'CONFIG_NET_MEDIATEK_PPE_EXTDEV'):
     on(x)
 open(p, 'w').write(s)
-print('[diy] extdev: kernel config enabled')
+print('[diy] extdev: NF_CONNTRACK + PPE_EXTDEV written; WED/HW offload untouched')
 PYEXT
 
         # built-in 模块参数：modules.d 对 built-in 无效，用 uci-defaults 写 sysfs
@@ -409,25 +397,41 @@ PYEXT
 # 运行时一键回退：echo 0 > /sys/module/mtk_eth/parameters/extdev_enable
 P=/sys/module/mtk_eth/parameters/extdev_prefix
 [ -w "$P" ] && echo '__PREFIX__' > "$P"
+# 无线 egress 保守默认关闭：WED 默认开启，WDMA FOE 路径尚未实机验证
+W=/sys/module/mtk_eth/parameters/extdev_wireless
+[ -w "$W" ] && echo '__WIRELESS__' > "$W"
 exit 0
 EOF
-        sed -i "s|__PREFIX__|$EXTDEV_PREFIX|g" files/etc/uci-defaults/96-mtk-ppe-extdev
+        sed -i "s|__PREFIX__|$EXTDEV_PREFIX|g; s|__WIRELESS__|$EXTDEV_WIRELESS|g" files/etc/uci-defaults/96-mtk-ppe-extdev
         chmod +x files/etc/uci-defaults/96-mtk-ppe-extdev
 
         # 把 extdev 判据追加到验证脚本
         cat >> files/usr/sbin/verify-ppe.sh <<'EOF'
 
 say "8. extdev（USB/5G → PPE 回送层）"
-echo "  sysfs: /sys/module/mtk_eth/parameters/extdev_{prefix,enable}"
-for f in /sys/kernel/debug/mtk_ppe_extdev/*; do
-    [ -r "$f" ] && { printf '  %-12s = ' "$(basename "$f")"; cat "$f"; }
+echo "  sysfs: /sys/module/mtk_eth/parameters/extdev_{prefix,enable,wireless}"
+for p in prefix enable wireless; do
+    f="/sys/module/mtk_eth/parameters/extdev_$p"
+    [ -r "$f" ] && { printf '  extdev_%-9s = ' "$p"; cat "$f"; }
 done
-echo "  rx_inject 涨 + stale_out=0 + ppe0/bind 有 BND 流 = 硬件真在转发"
-dmesg | grep -i extdev | tail -10
+for f in /sys/kernel/debug/mtk_ppe_extdev/*; do
+    [ -r "$f" ] && { printf '  %-16s = ' "$(basename "$f")"; cat "$f"; }
+done
+echo "  ★ hw_ready 必须为 1：0 = 启动门闩未开（GMAC 没 UP），此时不注入属正常"
+echo "  ★ 整机复位 / 异常时先：echo 0 > /sys/module/mtk_eth/parameters/extdev_enable"
+echo "  有线 egress 才有 PPE：wireless_skip 增长属正常（WiFi 走软件路径）"
+echo "  rx_inject 涨 + stale_out=0 + hw_ready=1 + ppe0/bind 有 BND 流 = 硬件真在转发"
+dmesg | grep -i -E 'extdev|mt7915|wed' | tail -15
 EOF
 
         echo "[diy] extdev: ENABLED (patch + 3 sources + kconfig + rootfs)"
         echo "[diy] extdev: fport=PSE_PPE0_PORT, bind_hw=on, stale self-heal=on"
+        echo "[diy] extdev: hw_ready gate=ON (probe->NETDEV_UP), GC armed on UP"
+        if [ "$EXTDEV_WIRELESS" = "1" ]; then
+            echo "[diy] extdev: wireless egress=ALLOWED (experimental)"
+        else
+            echo "[diy] extdev: wireless egress=REFUSED (WiFi-safe default)"
+        fi
     else
         echo "[diy] extdev: 实现包不全或 $KCFG 缺失 -> 自动回退为 0（不破坏编译）" >&2
         USB5G_EXTDEV=0
@@ -440,9 +444,13 @@ fi
 echo "[diy] --- summary ---"
 echo "[diy] no SONiC fullcone / no NAT patch / no package removal / no service restart"
 echo "[diy] LAN fallback   : files/etc/uci-defaults/97-lan-fallback"
-echo "[diy] PPE offload    : files/etc/uci-defaults/98-mtk-ppe-offload"
-echo "[diy] WED module     : $([ "$PPE_WED" = 1 ] && echo files/etc/modules.d/50-mtk-ppe-wed || echo disabled)"
+echo "[diy] WED / HW offld : 25.12 defaults kept (NOT written by this script)"
 echo "[diy] verify script  : files/usr/sbin/verify-ppe.sh"
 echo "[diy] USB5G extdev   : $USB5G_EXTDEV (1 = PSE_PPE0_PORT 注入 + bind_hw)"
+if [ "$EXTDEV_WIRELESS" = "1" ]; then
+    echo "[diy] extdev WiFi    : 1 (WDMA FOE allowed, experimental)"
+else
+    echo "[diy] extdev WiFi    : 0 (WiFi on software path, no WDMA FOE)"
+fi
 echo "[diy] extdev pkg     : $([ "$USB5G_EXTDEV" = 1 ] && echo custom/extdev/ || echo not used)"
 echo "[diy] done"
